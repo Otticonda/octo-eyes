@@ -1,0 +1,14 @@
+{
+  "name": "octo-eyes",
+  "version": "1.0.0",
+  "description": "Octo's eyes: a connector that reads pump.fun, DexScreener and the Solana chain.",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: octo-eyes
+    runtime: node
+    plan: free
+    buildCommand: "echo no build needed"
+    startCommand: "node server.js"
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: OCTO_SECRET
+        generateValue: true
+      - key: SOLANA_RPC_URL
+        sync: false
+      - key: WATCH_WALLETS
+        sync: false
