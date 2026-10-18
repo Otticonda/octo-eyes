@@ -17,7 +17,7 @@ const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const SECRET = (process.env.OCTO_SECRET || "").trim();
 const MCP_PATH = SECRET ? `/mcp/${SECRET}` : "/mcp";
 const STREAM_URL = "wss://pumpportal.fun/api/data";
-const VERSION = "3.5.0";
+const VERSION = "3.6.0";
 const PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
 const CA_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -1025,8 +1025,8 @@ const numEnv = (k, d) => {
   return Number.isFinite(v) && v > 0 ? v : d;
 };
 const LIMITS = {
-  maxBuySol: numEnv("MAX_BUY_SOL", 0.05),
-  dailyBudgetSol: numEnv("DAILY_BUDGET_SOL", 0.25),
+  maxBuySol: numEnv("MAX_BUY_SOL", 0.1),
+  dailyBudgetSol: numEnv("DAILY_BUDGET_SOL", 0.5),
   maxOpenPositions: numEnv("MAX_OPEN_POSITIONS", 3),
   reserveSol: numEnv("RESERVE_SOL", 0.02), // always left in the wallet for fees
   slippagePct: numEnv("SLIPPAGE_PCT", 15),
@@ -1627,39 +1627,69 @@ async function riskDial(fresh = false) {
 // Paper only. Every 5 minutes: the scanner's top picks, a full token report on the best,
 // and a paper buy if it passes plain rules. It is the baseline Octo's own calls have to beat.
 let autoState = { lastRun: null, lastResult: null };
+// Which coins the auto baseline may consider (Otti's Axiom "Final Stretch" filter, translated to
+// what Octo sees): pump.fun coins still on their curve, 3-30 min old, $7K+ market cap,
+// top 10 holders at most 30%, curve at least 50% full. Each one can be changed on Render.
+const AUTO_FILTER = {
+  minAgeMin: numEnv("AUTO_MIN_AGE_MIN", 3),
+  maxAgeMin: numEnv("AUTO_MAX_AGE_MIN", 30),
+  minMarketCapUsd: numEnv("AUTO_MIN_MCAP_USD", 7000),
+  maxTop10Pct: numEnv("AUTO_MAX_TOP10_PCT", 30),
+  minCurvePct: numEnv("AUTO_MIN_CURVE_PCT", 50),
+  onlyOnCurve: !/^(0|false|off|no)$/i.test(process.env.AUTO_ONLY_ON_CURVE || ""),
+  everySec: numEnv("AUTO_EVERY_SEC", 60),
+  reportsPerRun: numEnv("AUTO_REPORTS_PER_RUN", 3),
+};
+let autoRunning = false;
 async function autoPaperTick() {
-  if (!AUTO_PAPER || !tradingOn) return;
-  rollDay();
-  autoState.lastRun = new Date().toISOString();
-  if (positions.size >= LIMITS.maxOpenPositions) return (autoState.lastResult = "positions full");
-  if (spentToday + RULES.minTicketSol > LIMITS.dailyBudgetSol) return (autoState.lastResult = "daily budget used");
-  const dial = await riskDial().catch(() => null);
-  if (!dial || dial.standDown) return (autoState.lastResult = `stand-down (dial ${dial?.memeDial ?? "unreadable"})`);
-  const { picks } = await scannerPicks(5);
-  const fresh = picks.filter((p) => !positions.has(p.mint) && !closedTrades.some((t) => t.mint === p.mint) && !rejections.some((r) => r.mint === p.mint));
-  for (const pick of fresh.slice(0, 2)) {
-    const r = await tokenReport(pick.mint).catch(() => null);
-    const s = compactSignals(r);
-    const why = [];
-    if (!s) why.push("no report");
-    else {
-      if (s.risk !== "low") why.push(`rug radar ${s.risk} (${s.riskScore})`);
-      if (s.top10HoldersPct != null && s.top10HoldersPct > 30) why.push(`top 10 hold ${s.top10HoldersPct}%`);
-      if (s.devHoldingPct != null && s.devHoldingPct > 5) why.push(`dev holds ${s.devHoldingPct}%`);
-      if (s.bundledPct != null && s.bundledPct > 10) why.push(`bundled ${s.bundledPct}%`);
+  if (!AUTO_PAPER || !tradingOn || autoRunning) return;
+  autoRunning = true;
+  try {
+    rollDay();
+    autoState.lastRun = new Date().toISOString();
+    if (positions.size >= LIMITS.maxOpenPositions) return (autoState.lastResult = "positions full");
+    if (spentToday + RULES.minTicketSol > LIMITS.dailyBudgetSol) return (autoState.lastResult = "daily budget used");
+    if (realizedToday <= -RULES.maxDailyLossSol) return (autoState.lastResult = "daily loss stop hit");
+    const dial = await riskDial().catch(() => null);
+    if (!dial || dial.standDown) return (autoState.lastResult = `stand-down (dial ${dial?.memeDial ?? "unreadable"})`);
+    const F = AUTO_FILTER;
+    const { picks } = await scannerPicks(20);
+    const seen = (m) => positions.has(m) || closedTrades.some((t) => t.mint === m) || rejections.some((r) => r.mint === m);
+    const fits = picks.filter(
+      (p) =>
+        !seen(p.mint) &&
+        (!F.onlyOnCurve || !p.migrated) &&
+        p.ageMinutes >= F.minAgeMin &&
+        p.ageMinutes <= F.maxAgeMin &&
+        (p.marketCapUsd ?? 0) >= F.minMarketCapUsd &&
+        (p.bondingCurveProgressPct ?? 0) >= F.minCurvePct,
+    );
+    for (const pick of fits.slice(0, F.reportsPerRun)) {
+      const r = await tokenReport(pick.mint).catch(() => null);
+      const s = compactSignals(r);
+      const why = [];
+      if (!s) why.push("no report");
+      else {
+        if (s.top10HoldersPct != null && s.top10HoldersPct > F.maxTop10Pct) why.push(`top 10 hold ${s.top10HoldersPct}%`);
+        if (s.risk !== "low") why.push(`rug radar ${s.risk} (${s.riskScore})`);
+        if (s.devHoldingPct != null && s.devHoldingPct > 5) why.push(`dev holds ${s.devHoldingPct}%`);
+        if (s.bundledPct != null && s.bundledPct > 10) why.push(`bundled ${s.bundledPct}%`);
+      }
+      if (why.length) {
+        logReject(pick.mint, "auto: " + why.join("; "), { source: "auto", momentumScore: pick.momentumScore });
+        continue;
+      }
+      try {
+        await buy(pick.mint, LIMITS.maxBuySol, `auto: final stretch, curve ${pick.bondingCurveProgressPct}%, ${Math.round(pick.ageMinutes)}m old, rug radar low`, null, "auto");
+        return (autoState.lastResult = `bought ${pick.symbol || pick.mint}`);
+      } catch (e) {
+        return (autoState.lastResult = "buy refused: " + e.message);
+      }
     }
-    if (why.length) {
-      logReject(pick.mint, "auto: " + why.join("; "), { source: "auto", momentumScore: pick.momentumScore });
-      continue;
-    }
-    try {
-      await buy(pick.mint, LIMITS.maxBuySol, `auto: scanner momentum ${pick.momentumScore}, rug radar low`, null, "auto");
-      return (autoState.lastResult = `bought ${pick.symbol || pick.mint}`);
-    } catch (e) {
-      return (autoState.lastResult = "buy refused: " + e.message);
-    }
+    autoState.lastResult = fits.length ? "no pick passed the rug checks" : "nothing in the filter right now";
+  } finally {
+    autoRunning = false;
   }
-  autoState.lastResult = fresh.length ? "no pick passed the rules" : "no new picks";
 }
 
 // After a restart, rebuild positions from the coins actually in the wallet.
@@ -1894,7 +1924,7 @@ const TOOLS = [
         mode: PAPER ? "paper" : "live",
         stats: journalStats(),
         statsBySource: { chat: by("chat"), auto: by("auto") },
-        ...(PAPER ? { paperCashSol: paper.cashSol, paperStartSol: PAPER_START_SOL, paperSince: paper.startedAt, autoPaper: { on: AUTO_PAPER, ...autoState } } : {}),
+        ...(PAPER ? { paperCashSol: paper.cashSol, paperStartSol: PAPER_START_SOL, paperSince: paper.startedAt, autoPaper: { on: AUTO_PAPER, ...autoState, filter: AUTO_FILTER } } : {}),
         closedTrades: closedTrades.slice(0, n),
         openPositions: [...positions.values()],
         rejections: rejections.slice(0, Math.min(n, 50)),
@@ -2035,7 +2065,7 @@ server.listen(PORT, () => {
   } else streamState = "off";
   if (PAPER) {
     console.log(`Paper mode: ${PAPER_START_SOL} SOL simulated bank, trading ${tradingOn ? "on" : "paused"}, auto paper ${AUTO_PAPER ? "on" : "off"}`);
-    if (AUTO_PAPER && process.env.OCTO_NO_STREAM !== "1") setInterval(() => autoPaperTick().catch((e) => (autoState.lastResult = "error: " + e.message)), 5 * 60_000);
+    if (AUTO_PAPER && process.env.OCTO_NO_STREAM !== "1") setInterval(() => autoPaperTick().catch((e) => (autoState.lastResult = "error: " + e.message)), AUTO_FILTER.everySec * 1000);
   } else if (wallet) {
     console.log(`Trading wallet ${wallet.publicKey}, trading ${tradingOn ? "on" : "paused"}`);
     recoverPositions();

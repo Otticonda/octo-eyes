@@ -55,6 +55,22 @@ In paper mode, every 5 minutes Octo paper-buys the scanner's best fresh pick if 
 top 10 ≤ 30%, dev ≤ 5%, bundles ≤ 10%). These trades are tagged `auto`. Octo's own calls from chat are tagged `chat`.
 The journal splits the stats so you can see whether Octo's judgement beats the mechanical baseline. If it doesn't, it has no edge yet.
 
+### The auto baseline's filter
+
+Based on Otti's Axiom "Final Stretch" filter, translated to what Octo can see. The baseline looks every minute,
+reports on up to 3 matching coins, and paper-buys the first that also passes the rug checks
+(rug radar low, dev ≤ 5%, bundles ≤ 10%).
+
+| Setting | Default | What it does |
+| --- | --- | --- |
+| `AUTO_MIN_AGE_MIN` / `AUTO_MAX_AGE_MIN` | 3 / 30 | Coin age window in minutes. |
+| `AUTO_MIN_MCAP_USD` | 7000 | Minimum market cap. |
+| `AUTO_MAX_TOP10_PCT` | 30 | Most the top 10 holders may own. |
+| `AUTO_MIN_CURVE_PCT` | 50 | "Final stretch": how full the pump.fun curve must be. |
+| `AUTO_ONLY_ON_CURVE` | on | Skip coins that already migrated. |
+| `AUTO_EVERY_SEC` | 60 | How often the baseline looks. |
+| `AUTO_REPORTS_PER_RUN` | 3 | Most coins it reports on per look. |
+
 ### Settings
 
 | Setting | Default | What it does |
@@ -65,8 +81,8 @@ The journal splits the stats so you can see whether Octo's judgement beats the m
 | `AUTO_PAPER` | on | The 5-minute auto paper trader. `false` turns it off. |
 | `OCTO_WALLET_KEY` | none | Live trading wallet's private key (base58, or the `[1,2,...]` array). Use a brand-new wallet. |
 | `TRADING_ENABLED` | on in paper, off live | Allows buys. You can also pause and resume from chat. |
-| `MAX_BUY_SOL` | 0.05 | Most SOL per buy, before the dial. |
-| `DAILY_BUDGET_SOL` | 0.25 | Most SOL spent on buys per day (UTC). |
+| `MAX_BUY_SOL` | 0.1 | Most SOL per buy, before the dial. |
+| `DAILY_BUDGET_SOL` | 0.5 | Most SOL spent on buys per day (UTC). |
 | `MAX_DAILY_LOSS_SOL` | 0.1 | Realized loss that stops buys for the day. |
 | `MAX_POOL_SHARE_PCT` | 2 | Largest buy as a % of the coin's pool. |
 | `MIN_TICKET_SOL` | 0.005 | Smaller tickets are skipped. |
