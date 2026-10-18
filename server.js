@@ -2,13 +2,22 @@
 // DexScreener and the Solana chain. Runs on Node 22+ (built-in fetch and WebSocket).
 
 import http from "node:http";
+import crypto from "node:crypto";
 
 const PORT = Number(process.env.PORT) || 3000;
-const RPC_URL = process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com";
+// Accepts a full RPC link, or just a Helius API key.
+const RPC_RAW = (process.env.SOLANA_RPC_URL || "").trim();
+const RPC_URL = !RPC_RAW
+  ? "https://api.mainnet-beta.solana.com"
+  : /^https?:\/\//i.test(RPC_RAW)
+    ? RPC_RAW
+    : `https://mainnet.helius-rpc.com/?api-key=${encodeURIComponent(RPC_RAW)}`;
+const RPC_KIND = !RPC_RAW ? "public (slow)" : RPC_URL.includes("helius") ? "helius" : "custom";
+const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const SECRET = (process.env.OCTO_SECRET || "").trim();
 const MCP_PATH = SECRET ? `/mcp/${SECRET}` : "/mcp";
 const STREAM_URL = "wss://pumpportal.fun/api/data";
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 const PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
 const CA_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -17,7 +26,7 @@ const PUMP_INITIAL_REAL_TOKENS = 793_100_000 * 1e6; // tokens sold along the cur
 const round = (n, d = 2) => (n == null || !Number.isFinite(Number(n)) ? null : Math.round(Number(n) * 10 ** d) / 10 ** d);
 
 // ---------------------------------------------------------------- helpers
-async function getJSON(url, opts = {}, timeoutMs = 9000) {
+async function getJSON(url, opts = {}, timeoutMs = 9000, retries = 1) {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), timeoutMs);
   try {
@@ -26,6 +35,11 @@ async function getJSON(url, opts = {}, timeoutMs = 9000) {
       signal: ctl.signal,
       headers: { accept: "application/json", "user-agent": "octo-eyes/" + VERSION, ...(opts.headers || {}) },
     });
+    if (res.status === 429 && retries > 0) {
+      clearTimeout(timer);
+      await new Promise((r) => setTimeout(r, 1200 + Math.random() * 800));
+      return getJSON(url, opts, timeoutMs, retries - 1);
+    }
     if (!res.ok) throw new Error(`${new URL(url).host} answered ${res.status}`);
     return await res.json();
   } catch (e) {
@@ -44,6 +58,116 @@ async function rpc(method, params) {
   });
   if (j.error) throw new Error(`Solana RPC ${method}: ${j.error.message}`);
   return j.result;
+}
+
+// ---------------------------------------------------------------- Solana address math (no libraries)
+const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+function b58decode(s) {
+  let n = 0n;
+  for (const ch of s) {
+    const i = B58.indexOf(ch);
+    if (i < 0) throw new Error("bad base58");
+    n = n * 58n + BigInt(i);
+  }
+  const out = [];
+  while (n > 0n) {
+    out.push(Number(n & 255n));
+    n >>= 8n;
+  }
+  for (const ch of s) {
+    if (ch === "1") out.push(0);
+    else break;
+  }
+  return Buffer.from(out.reverse());
+}
+function b58encode(buf) {
+  let n = BigInt("0x" + (Buffer.from(buf).toString("hex") || "0"));
+  let s = "";
+  while (n > 0n) {
+    s = B58[Number(n % 58n)] + s;
+    n /= 58n;
+  }
+  for (const b of buf) {
+    if (b === 0) s = "1" + s;
+    else break;
+  }
+  return s;
+}
+function pubkeyBytes(s) {
+  const b = b58decode(s);
+  if (b.length > 32) throw new Error("bad address");
+  return b.length === 32 ? b : Buffer.concat([Buffer.alloc(32 - b.length), b]);
+}
+// ed25519 "is this point on the curve" check, needed to derive program addresses
+const P = 2n ** 255n - 19n;
+const modp = (a) => ((a % P) + P) % P;
+function powmod(b, e) {
+  let r = 1n;
+  b = modp(b);
+  while (e > 0n) {
+    if (e & 1n) r = (r * b) % P;
+    b = (b * b) % P;
+    e >>= 1n;
+  }
+  return r;
+}
+const ED_D = modp(-121665n * powmod(121666n, P - 2n));
+function isOnCurve(bytes) {
+  const b = Buffer.from(bytes);
+  b[31] &= 0x7f;
+  let y = 0n;
+  for (let i = 31; i >= 0; i--) y = (y << 8n) | BigInt(b[i]);
+  if (y >= P) return false;
+  const y2 = (y * y) % P;
+  const x2 = (modp(y2 - 1n) * powmod(modp(ED_D * y2 + 1n), P - 2n)) % P;
+  if (x2 === 0n) return true;
+  const x = powmod(x2, (P + 3n) / 8n);
+  const xx = (x * x) % P;
+  return xx === x2 || xx === modp(-x2);
+}
+function findPDA(seeds, programId) {
+  const pid = pubkeyBytes(programId);
+  for (let bump = 255; bump >= 0; bump--) {
+    const h = crypto.createHash("sha256");
+    for (const s of seeds) h.update(s);
+    h.update(Buffer.from([bump]));
+    h.update(pid);
+    h.update(Buffer.from("ProgramDerivedAddress"));
+    const out = h.digest();
+    if (!isOnCurve(out)) return b58encode(out);
+  }
+  throw new Error("could not derive address");
+}
+
+// Reads a pump.fun coin's bonding curve straight from the chain (pump.fun can't block this).
+async function chainPump(ca) {
+  const bc = findPDA([Buffer.from("bonding-curve"), pubkeyBytes(ca)], PUMP_PROGRAM);
+  const acc = await rpc("getAccountInfo", [bc, { encoding: "base64" }]);
+  const v = acc?.value;
+  if (!v || v.owner !== PUMP_PROGRAM) return { found: false, bondingCurve: bc, note: "No pump.fun bonding curve for this token, so it's probably not a pump.fun coin." };
+  const d = Buffer.from(v.data[0], "base64");
+  if (d.length < 49) return { found: false, bondingCurve: bc, note: "Unexpected bonding curve data." };
+  const vTok = Number(d.readBigUInt64LE(8));
+  const vSol = Number(d.readBigUInt64LE(16));
+  const rTok = Number(d.readBigUInt64LE(24));
+  const rSol = Number(d.readBigUInt64LE(32));
+  const supply = Number(d.readBigUInt64LE(40));
+  const complete = d[48] === 1;
+  let creator = null;
+  if (d.length >= 81) {
+    const c = d.subarray(49, 81);
+    if (c.some((x) => x !== 0)) creator = b58encode(c);
+  }
+  const priceSol = vTok > 0 ? vSol / 1e9 / (vTok / 1e6) : null;
+  return {
+    found: true,
+    bondingCurve: bc,
+    creator,
+    migrated: complete,
+    bondingCurveProgressPct: complete ? 100 : rTok > 0 ? round((1 - rTok / PUMP_INITIAL_REAL_TOKENS) * 100, 1) : null,
+    marketCapSol: !complete && priceSol != null ? round((priceSol * supply) / 1e6, 2) : null,
+    solInCurve: complete ? null : round(rSol / 1e9, 3),
+  };
 }
 
 const cache = new Map();
@@ -95,42 +219,61 @@ async function marketData(ca) {
 // ---------------------------------------------------------------- pump.fun
 // pump.fun has no official public API; these are the endpoints its own site uses.
 async function pumpInfo(ca) {
-  return cached("pump:" + ca, 30_000, async () => {
-    const bases = ["https://frontend-api-v3.pump.fun", "https://frontend-api-v2.pump.fun", "https://frontend-api.pump.fun"];
-    let c = null;
-    let lastErr = null;
-    for (const b of bases) {
+  return cached("pump:" + ca, 20_000, async () => {
+    // 1) pump.fun's own website API (often blocks cloud servers), 2) the chain itself (always works)
+    let web = null;
+    let webErr = null;
+    try {
+      const c = await getJSON(`https://frontend-api-v3.pump.fun/coins/${ca}`, {}, 5000, 0);
+      if (c && c.mint) web = c;
+    } catch (e) {
+      webErr = e.message;
+    }
+    let chain = null;
+    let chainErr = null;
+    try {
+      chain = await chainPump(ca);
+    } catch (e) {
+      chainErr = e.message;
+    }
+    if (!web && !chain?.found) {
+      return { found: false, note: chain?.note || "Couldn't read this coin from pump.fun or the chain.", errors: { website: webErr, chain: chainErr } };
+    }
+    const seen = launches.find((l) => l.mint === ca);
+    let name = web?.name ?? seen?.name ?? null;
+    let symbol = web?.symbol ?? seen?.symbol ?? null;
+    if (!name) {
       try {
-        c = await getJSON(`${b}/coins/${ca}`);
-        if (c && c.mint) break;
-        c = null;
-      } catch (e) {
-        lastErr = e;
-      }
+        const a = await rpc("getAsset", { id: ca });
+        name = a?.content?.metadata?.name || null;
+        symbol = a?.content?.metadata?.symbol || null;
+      } catch {}
     }
-    if (!c) {
-      return { found: false, note: "pump.fun didn't return this coin. It may not be a pump.fun coin, or pump.fun is blocking requests right now." + (lastErr ? ` (${lastErr.message})` : "") };
-    }
-    const real = Number(c.real_token_reserves);
-    const progress = c.complete ? 100 : Number.isFinite(real) && real > 0 ? round((1 - real / PUMP_INITIAL_REAL_TOKENS) * 100, 1) : null;
+    const webReal = Number(web?.real_token_reserves);
     return {
       found: true,
-      name: c.name ?? null,
-      symbol: c.symbol ?? null,
-      creator: c.creator ?? null,
-      createdAt: c.created_timestamp ? new Date(c.created_timestamp).toISOString() : null,
-      marketCapUsd: c.usd_market_cap ?? null,
-      marketCapSol: c.market_cap ?? null,
-      migrated: !!c.complete,
-      bondingCurveProgressPct: progress,
-      bondingCurve: c.bonding_curve ?? null,
-      kingOfTheHillAt: c.king_of_the_hill_timestamp ? new Date(c.king_of_the_hill_timestamp).toISOString() : null,
-      replies: c.reply_count ?? null,
-      twitter: c.twitter || null,
-      telegram: c.telegram || null,
-      website: c.website || null,
-      description: (c.description || "").slice(0, 300),
-      pool: c.pump_swap_pool || c.raydium_pool || null,
+      source: web ? "pump.fun + on-chain" : "on-chain (pump.fun's website API is blocking this server)",
+      name,
+      symbol,
+      creator: chain?.creator ?? web?.creator ?? seen?.creator ?? null,
+      createdAt: web?.created_timestamp ? new Date(web.created_timestamp).toISOString() : seen?.at ?? null,
+      migrated: chain?.found ? chain.migrated : !!web?.complete,
+      bondingCurveProgressPct: chain?.found
+        ? chain.bondingCurveProgressPct
+        : web?.complete
+          ? 100
+          : Number.isFinite(webReal) && webReal > 0
+            ? round((1 - webReal / PUMP_INITIAL_REAL_TOKENS) * 100, 1)
+            : null,
+      marketCapSol: chain?.marketCapSol ?? web?.market_cap ?? null,
+      marketCapUsd: web?.usd_market_cap ?? null,
+      solInCurve: chain?.solInCurve ?? null,
+      bondingCurve: chain?.bondingCurve ?? web?.bonding_curve ?? null,
+      replies: web?.reply_count ?? null,
+      twitter: web?.twitter || null,
+      telegram: web?.telegram || null,
+      website: web?.website || null,
+      description: web ? (web.description || "").slice(0, 300) : null,
     };
   });
 }
@@ -257,6 +400,7 @@ function connectStream() {
         name: m.name ?? null,
         symbol: m.symbol ?? null,
         creator: m.traderPublicKey ?? null,
+        bondingCurve: m.bondingCurveKey ?? null,
         devInitialBuySol: m.solAmount ?? null,
         marketCapSol: m.marketCapSol ?? null,
         at: new Date().toISOString(),
@@ -427,7 +571,7 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://localhost");
 
   if (url.pathname === "/" || url.pathname === "/health") {
-    return send(res, 200, { name: "Octo Eyes", ok: true, stream: streamState, launchesSeen: launches.length, watching: watched.size });
+    return send(res, 200, { name: "Octo Eyes", version: VERSION, ok: true, rpc: RPC_KIND, stream: streamState, launchesSeen: launches.length, watching: watched.size });
   }
   if (url.pathname !== MCP_PATH) return send(res, 404, { error: "Not found" });
   if (req.method === "GET" || req.method === "DELETE") return send(res, 405, { error: "Method not allowed" }, { allow: "POST" });
