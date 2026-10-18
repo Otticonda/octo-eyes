@@ -17,7 +17,7 @@ const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const SECRET = (process.env.OCTO_SECRET || "").trim();
 const MCP_PATH = SECRET ? `/mcp/${SECRET}` : "/mcp";
 const STREAM_URL = "wss://pumpportal.fun/api/data";
-const VERSION = "1.2.0";
+const VERSION = "1.3.0";
 const PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
 const CA_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -215,6 +215,63 @@ async function dexScreener(ca) {
   };
 }
 
+// Main source: Jupiter's token API (rich data, rarely blocks servers).
+// Tries the free lite host first, then api.jup.ag (with JUP_API_KEY if set).
+async function jupiter(ca) {
+  const key = (process.env.JUP_API_KEY || "").trim();
+  const urls = [
+    [`https://lite-api.jup.ag/tokens/v2/search?query=${ca}`, {}],
+    [`https://api.jup.ag/tokens/v2/search?query=${ca}`, key ? { headers: { "x-api-key": key } } : {}],
+  ];
+  let lastErr = null;
+  for (const [u, o] of urls) {
+    try {
+      const j = await getJSON(u, o, 8000, 0);
+      const t = (Array.isArray(j) ? j : []).find((x) => x && x.id === ca);
+      if (!t) return null;
+      const st = (s) =>
+        s
+          ? {
+              priceChangePct: round(s.priceChange, 2),
+              buyVolumeUsd: round(s.buyVolume, 0),
+              sellVolumeUsd: round(s.sellVolume, 0),
+              buys: s.numBuys ?? null,
+              sells: s.numSells ?? null,
+              traders: s.numTraders ?? null,
+              netBuyers: s.numNetBuyers ?? null,
+              organicBuyers: s.numOrganicBuyers ?? null,
+              liquidityChangePct: round(s.liquidityChange, 2),
+            }
+          : null;
+      return {
+        found: true,
+        source: "Jupiter",
+        name: t.name ?? null,
+        symbol: t.symbol ?? null,
+        priceUsd: t.usdPrice ?? null,
+        marketCapUsd: t.mcap ?? t.fdv ?? null,
+        fdvUsd: t.fdv ?? null,
+        liquidityUsd: t.liquidity ?? null,
+        holders: t.holderCount ?? null,
+        organicScore: t.organicScore ?? null,
+        organicScoreLabel: t.organicScoreLabel ?? null,
+        verified: t.isVerified ?? null,
+        tags: t.tags ?? [],
+        firstPoolCreatedAt: t.firstPool?.createdAt ?? null,
+        ageHours: t.firstPool?.createdAt ? round((Date.now() - Date.parse(t.firstPool.createdAt)) / 3.6e6, 1) : null,
+        audit: t.audit ?? null,
+        stats5m: st(t.stats5m),
+        stats1h: st(t.stats1h),
+        stats6h: st(t.stats6h),
+        stats24h: st(t.stats24h),
+      };
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error("Jupiter unavailable");
+}
+
 // Backup source when DexScreener rate-limits the server.
 async function geckoTerminal(ca) {
   const j = await getJSON(`https://api.geckoterminal.com/api/v2/networks/solana/tokens/${ca}/pools?page=1`);
@@ -244,19 +301,31 @@ async function geckoTerminal(ca) {
 async function marketData(ca) {
   return cached("mkt:" + ca, 20_000, async () => {
     const errors = [];
+    let jup = null;
     try {
-      const d = await dexScreener(ca);
-      if (d) return d;
+      jup = await jupiter(ca);
+    } catch (e) {
+      errors.push("Jupiter: " + e.message);
+    }
+    // Jupiter has the numbers; DexScreener adds socials and a chart link when it isn't rate-limited.
+    let dex = null;
+    try {
+      dex = await dexScreener(ca);
     } catch (e) {
       errors.push("DexScreener: " + e.message);
     }
+    if (jup) {
+      if (dex) Object.assign(jup, { dex: dex.dex, chartUrl: dex.url, websites: dex.websites, socials: dex.socials, paidBoostsActive: dex.paidBoostsActive });
+      return jup;
+    }
+    if (dex) return dex;
     try {
       const g = await geckoTerminal(ca);
       if (g) return g;
     } catch (e) {
       errors.push("GeckoTerminal: " + e.message);
     }
-    if (errors.length === 2) return { found: false, error: errors.join("; ") };
+    if (errors.length === 3) return { found: false, error: errors.join("; ") };
     return { found: false, note: "No trading pools yet. A pump.fun coin still on its bonding curve has no DEX pool until it migrates.", errors: errors.length ? errors : undefined };
   });
 }
@@ -268,6 +337,10 @@ async function solPriceUsd() {
       const j = await getJSON(`https://api.geckoterminal.com/api/v2/simple/networks/solana/token_price/${SOL}`);
       const v = Number(j?.data?.attributes?.token_prices?.[SOL]);
       if (v > 0) return v;
+    } catch {}
+    try {
+      const jp = await jupiter(SOL);
+      if (jp?.priceUsd > 0) return jp.priceUsd;
     } catch {}
     try {
       const d = await dexScreener(SOL);
@@ -500,7 +573,7 @@ const TOOLS = [
   },
   {
     name: "market_data",
-    description: "DexScreener market data for a Solana token: price, market cap, liquidity, volume and price change over 5m/1h/6h/24h, buy and sell counts, pair age, socials.",
+    description: "Market data for a Solana token (Jupiter, with DexScreener and GeckoTerminal as backups): price, market cap, liquidity, holder count, buy and sell volume, buys, sells, traders and price change over 5m/1h/6h/24h, organic score, audit info, age, socials.",
     inputSchema: caSchema,
     run: async ({ ca }) => marketData(needCA(ca)),
   },
