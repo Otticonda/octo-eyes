@@ -17,7 +17,7 @@ const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const SECRET = (process.env.OCTO_SECRET || "").trim();
 const MCP_PATH = SECRET ? `/mcp/${SECRET}` : "/mcp";
 const STREAM_URL = "wss://pumpportal.fun/api/data";
-const VERSION = "1.4.0";
+const VERSION = "2.0.0";
 const PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
 const CA_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -572,6 +572,293 @@ function connectStream() {
   });
 }
 
+// ---------------------------------------------------------------- trading (Octo's own wallet)
+// Every limit is enforced here, on the server, so nothing said in chat can exceed it.
+const numEnv = (k, d) => {
+  const v = Number(process.env[k]);
+  return Number.isFinite(v) && v > 0 ? v : d;
+};
+const LIMITS = {
+  maxBuySol: numEnv("MAX_BUY_SOL", 0.05),
+  dailyBudgetSol: numEnv("DAILY_BUDGET_SOL", 0.25),
+  maxOpenPositions: numEnv("MAX_OPEN_POSITIONS", 3),
+  reserveSol: numEnv("RESERVE_SOL", 0.02), // always left in the wallet for fees
+  slippagePct: numEnv("SLIPPAGE_PCT", 15),
+  priorityFeeSol: numEnv("PRIORITY_FEE_SOL", 0.0005),
+  takeProfit1X: numEnv("TAKE_PROFIT_1_X", 2), // sell half here
+  takeProfit2X: numEnv("TAKE_PROFIT_2_X", 3.5), // sell the rest here
+  stopLossPct: numEnv("STOP_LOSS_PCT", 35),
+  maxHoldHours: numEnv("MAX_HOLD_HOURS", 12),
+};
+let tradingOn = /^(1|true|on|yes)$/i.test(process.env.TRADING_ENABLED || "");
+const positions = new Map(); // mint -> position
+const tradeLog = [];
+let spentDay = new Date().toISOString().slice(0, 10);
+let spentToday = 0;
+let tradeLock = Promise.resolve();
+
+function loadWallet() {
+  const raw = (process.env.OCTO_WALLET_KEY || "").trim();
+  if (!raw) return null;
+  let bytes = raw.startsWith("[") ? Buffer.from(JSON.parse(raw)) : b58decode(raw);
+  if (bytes.length < 64 && bytes.length > 32) bytes = Buffer.concat([Buffer.alloc(64 - bytes.length), bytes]);
+  if (bytes.length !== 64 && bytes.length !== 32) throw new Error("OCTO_WALLET_KEY is not a Solana private key");
+  const seed = bytes.subarray(0, 32);
+  const key = crypto.createPrivateKey({ key: Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), seed]), format: "der", type: "pkcs8" });
+  const pub = crypto.createPublicKey(key).export({ format: "der", type: "spki" }).subarray(-32);
+  if (bytes.length === 64 && !pub.equals(bytes.subarray(32))) throw new Error("OCTO_WALLET_KEY doesn't match its own public key");
+  return { key, publicKey: b58encode(pub), pubBytes: pub };
+}
+let wallet = null;
+let walletError = null;
+try {
+  wallet = loadWallet();
+} catch (e) {
+  walletError = e.message;
+}
+
+function readCompactU16(buf, off) {
+  let len = 0;
+  let size = 0;
+  for (;;) {
+    const b = buf[off + size];
+    len |= (b & 0x7f) << (7 * size);
+    size++;
+    if ((b & 0x80) === 0) break;
+  }
+  return [len, size];
+}
+// Signs a serialized Solana transaction whose fee payer (first signer) is Octo's wallet.
+function signTx(txBytes, w) {
+  const [n, sz] = readCompactU16(txBytes, 0);
+  const msg = txBytes.subarray(sz + 64 * n);
+  let o = msg[0] & 0x80 ? 1 : 0;
+  o += 3;
+  const [, s2] = readCompactU16(msg, o);
+  o += s2;
+  const payer = msg.subarray(o, o + 32);
+  if (!Buffer.from(payer).equals(w.pubBytes)) throw new Error("Refusing to sign: the transaction's payer isn't Octo's wallet");
+  const sig = crypto.sign(null, msg, w.key);
+  const out = Buffer.from(txBytes);
+  sig.copy(out, sz);
+  return { tx: out, signature: b58encode(sig) };
+}
+
+async function solBalance() {
+  const r = await rpc("getBalance", [wallet.publicKey]);
+  return (r?.value ?? 0) / 1e9;
+}
+async function tokenBalance(mint) {
+  const r = await rpc("getTokenAccountsByOwner", [wallet.publicKey, { mint }, { encoding: "jsonParsed" }]);
+  let ui = 0;
+  let raw = 0n;
+  for (const a of r?.value || []) {
+    const t = a?.account?.data?.parsed?.info?.tokenAmount;
+    ui += Number(t?.uiAmount) || 0;
+    raw += BigInt(t?.amount || "0");
+  }
+  return { ui, raw };
+}
+
+// Price of one token in SOL: from the bonding curve while on pump.fun, otherwise from Jupiter.
+async function priceInSol(mint) {
+  try {
+    const c = await chainPump(mint);
+    if (c.found && !c.migrated && c.marketCapSol != null) return c.marketCapSol / 1e9;
+  } catch {}
+  const [j, sol] = await Promise.all([jupiter(mint).catch(() => null), solPriceUsd()]);
+  if (j?.priceUsd && sol) return j.priceUsd / sol;
+  return null;
+}
+
+async function confirmSig(sig, ms = 45_000) {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    await new Promise((r) => setTimeout(r, 2000));
+    try {
+      const r = await rpc("getSignatureStatuses", [[sig], { searchTransactionHistory: false }]);
+      const st = r?.value?.[0];
+      if (st?.err) throw new Error("Transaction failed on-chain: " + JSON.stringify(st.err));
+      if (st && (st.confirmationStatus === "confirmed" || st.confirmationStatus === "finalized")) return true;
+    } catch (e) {
+      if (String(e.message).startsWith("Transaction failed")) throw e;
+    }
+  }
+  throw new Error("Not confirmed in time. Check the signature on Solscan before retrying.");
+}
+
+async function swap(action, mint, amount) {
+  const res = await fetch("https://pumpportal.fun/api/trade-local", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      publicKey: wallet.publicKey,
+      action,
+      mint,
+      amount,
+      denominatedInSol: action === "buy" ? "true" : "false",
+      slippage: LIMITS.slippagePct,
+      priorityFee: LIMITS.priorityFeeSol,
+      pool: "auto",
+    }),
+  });
+  if (res.status !== 200) throw new Error("PumpPortal refused the trade: " + (await res.text()).slice(0, 200));
+  const { tx, signature } = signTx(Buffer.from(await res.arrayBuffer()), wallet);
+  await rpc("sendTransaction", [tx.toString("base64"), { encoding: "base64", skipPreflight: true, maxRetries: 3 }]);
+  await confirmSig(signature);
+  return signature;
+}
+
+function logTrade(t) {
+  tradeLog.unshift({ ...t, at: new Date().toISOString() });
+  if (tradeLog.length > 100) tradeLog.pop();
+}
+function rollDay() {
+  const d = new Date().toISOString().slice(0, 10);
+  if (d !== spentDay) {
+    spentDay = d;
+    spentToday = 0;
+  }
+}
+const withLock = (fn) => {
+  const p = tradeLock.then(fn, fn);
+  tradeLock = p.catch(() => {});
+  return p;
+};
+
+function needWallet() {
+  if (!wallet) throw new Error(walletError || "No trading wallet set. Add OCTO_WALLET_KEY in Render's Environment settings.");
+}
+
+async function buy(mint, sol, reason) {
+  needWallet();
+  if (!tradingOn) throw new Error("Trading is paused. Turn it on with set_trading, or set TRADING_ENABLED=true on Render.");
+  return withLock(async () => {
+    rollDay();
+    const amt = Math.min(Number(sol) || LIMITS.maxBuySol, LIMITS.maxBuySol);
+    if (!(amt > 0)) throw new Error("Buy amount must be above 0.");
+    if (positions.has(mint)) throw new Error("Octo already holds this coin.");
+    if (positions.size >= LIMITS.maxOpenPositions) throw new Error(`Already at the limit of ${LIMITS.maxOpenPositions} open positions.`);
+    if (spentToday + amt > LIMITS.dailyBudgetSol + 1e-9) throw new Error(`Daily budget reached (${round(spentToday, 3)} of ${LIMITS.dailyBudgetSol} SOL spent today).`);
+    const bal = await solBalance();
+    if (bal - amt - LIMITS.priorityFeeSol < LIMITS.reserveSol) throw new Error(`Not enough SOL: wallet has ${round(bal, 4)} SOL and keeps ${LIMITS.reserveSol} SOL for fees.`);
+    const safety = await safetyCheck(mint, {}).catch(() => null);
+    if (safety?.found === false) throw new Error("That address isn't a token.");
+    if (safety?.mintAuthority) throw new Error("Refused: mint authority is still on (more tokens can be printed).");
+    if (safety?.freezeAuthority) throw new Error("Refused: freeze authority is on (honeypot risk).");
+
+    const before = await tokenBalance(mint);
+    const sig = await swap("buy", mint, amt);
+    let after = await tokenBalance(mint);
+    for (let i = 0; i < 4 && after.ui <= before.ui; i++) {
+      await new Promise((r) => setTimeout(r, 2000));
+      after = await tokenBalance(mint);
+    }
+    const tokens = after.ui - before.ui;
+    spentToday += amt;
+    const pos = {
+      mint,
+      tokens,
+      costSol: amt,
+      entryPriceSol: tokens > 0 ? amt / tokens : null,
+      soldHalf: false,
+      openedAt: new Date().toISOString(),
+      reason: String(reason || "").slice(0, 200),
+    };
+    positions.set(mint, pos);
+    logTrade({ side: "buy", mint, sol: amt, tokens, signature: sig, reason: pos.reason });
+    return { ok: true, signature: sig, solscan: `https://solscan.io/tx/${sig}`, position: pos, spentToday: round(spentToday, 3) };
+  });
+}
+
+async function sell(mint, percent, why) {
+  needWallet();
+  return withLock(async () => {
+    const pct = Math.max(1, Math.min(100, Math.round(Number(percent) || 100)));
+    const bal = await tokenBalance(mint);
+    if (!(bal.ui > 0)) {
+      positions.delete(mint);
+      throw new Error("Octo's wallet holds none of this coin.");
+    }
+    const solBefore = await solBalance();
+    const sig = await swap("sell", mint, `${pct}%`);
+    const solAfter = await solBalance().catch(() => null);
+    const received = solAfter != null ? round(solAfter - solBefore, 4) : null;
+    const pos = positions.get(mint);
+    if (pos) {
+      if (pct >= 100) positions.delete(mint);
+      else pos.tokens = Math.max(0, pos.tokens * (1 - pct / 100));
+    }
+    logTrade({ side: "sell", mint, percent: pct, solReceived: received, signature: sig, reason: why || "manual" });
+    return { ok: true, signature: sig, solscan: `https://solscan.io/tx/${sig}`, percentSold: pct, solReceived: received };
+  });
+}
+
+async function positionView(p) {
+  const price = await priceInSol(p.mint).catch(() => null);
+  const value = price != null ? price * p.tokens : null;
+  const multiple = p.entryPriceSol && price ? price / p.entryPriceSol : null;
+  return { ...p, priceSol: price, valueSol: value != null ? round(value, 4) : null, multiple: multiple != null ? round(multiple, 2) : null, pnlPct: multiple != null ? round((multiple - 1) * 100, 1) : null };
+}
+
+async function walletStatus() {
+  needWallet();
+  rollDay();
+  const [bal, views] = await Promise.all([solBalance(), Promise.all([...positions.values()].map(positionView))]);
+  return {
+    address: wallet.publicKey,
+    solBalance: round(bal, 4),
+    trading: tradingOn ? "on" : "paused",
+    spentToday: round(spentToday, 3),
+    limits: LIMITS,
+    openPositions: views,
+    recentTrades: tradeLog.slice(0, 15),
+  };
+}
+
+// Automatic exits: take profit, stop loss, max hold time. Runs every 20 seconds.
+async function exitLoop() {
+  if (!wallet || !positions.size) return;
+  for (const p of [...positions.values()]) {
+    try {
+      const v = await positionView(p);
+      const ageH = (Date.now() - Date.parse(p.openedAt)) / 3.6e6;
+      if (v.multiple == null) continue;
+      if (v.multiple <= 1 - LIMITS.stopLossPct / 100) await sell(p.mint, 100, `stop loss at ${v.pnlPct}%`);
+      else if (v.multiple >= LIMITS.takeProfit2X) await sell(p.mint, 100, `take profit at ${v.multiple}x`);
+      else if (!p.soldHalf && v.multiple >= LIMITS.takeProfit1X) {
+        await sell(p.mint, 50, `first take profit at ${v.multiple}x`);
+        const still = positions.get(p.mint);
+        if (still) still.soldHalf = true;
+      } else if (ageH >= LIMITS.maxHoldHours) await sell(p.mint, 100, `held ${round(ageH, 1)}h, closing`);
+    } catch (e) {
+      logTrade({ side: "error", mint: p.mint, error: e.message });
+    }
+  }
+}
+
+// After a restart, rebuild positions from the coins actually in the wallet.
+// Entry prices are lost on restart, so recovered positions start from today's price.
+async function recoverPositions() {
+  if (!wallet) return;
+  try {
+    const progs = ["TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", TOKEN_2022];
+    for (const programId of progs) {
+      const r = await rpc("getTokenAccountsByOwner", [wallet.publicKey, { programId }, { encoding: "jsonParsed" }]);
+      for (const a of r?.value || []) {
+        const info = a?.account?.data?.parsed?.info;
+        const ui = Number(info?.tokenAmount?.uiAmount) || 0;
+        if (ui <= 0 || positions.has(info.mint)) continue;
+        const price = await priceInSol(info.mint).catch(() => null);
+        if (price == null || price * ui < 0.001) continue; // ignore dust
+        positions.set(info.mint, { mint: info.mint, tokens: ui, costSol: round(price * ui, 4), entryPriceSol: price, soldHalf: false, openedAt: new Date().toISOString(), reason: "recovered after restart (entry reset to current price)" });
+      }
+    }
+  } catch (e) {
+    logTrade({ side: "error", error: "recover: " + e.message });
+  }
+}
+
 // ---------------------------------------------------------------- tools
 const caSchema = { type: "object", properties: { ca: { type: "string", description: "The token's Solana contract address (mint)." } }, required: ["ca"] };
 
@@ -650,6 +937,45 @@ const TOOLS = [
       trades: walletTrades.slice(0, Math.max(1, Math.min(100, Number(limit) || 30))),
     }),
   },
+  {
+    name: "wallet_status",
+    description: "Octo's trading wallet: address, SOL balance, whether trading is on, today's spend, the hard limits, open positions with entry, current value, multiple and P&L, and recent trades.",
+    inputSchema: { type: "object", properties: {} },
+    run: async () => walletStatus(),
+  },
+  {
+    name: "buy",
+    description: "Buy a Solana token with Octo's wallet. Capped by server limits (max SOL per buy, daily budget, max open positions); refuses tokens with mint or freeze authority on. Exits (take profit, stop loss, max hold) then run automatically.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ca: { type: "string", description: "Token mint address." },
+        sol: { type: "number", description: "SOL to spend; anything above the per-buy limit is cut down to it." },
+        reason: { type: "string", description: "Why Octo is buying, in a few words." },
+      },
+      required: ["ca"],
+    },
+    run: async ({ ca, sol, reason }) => buy(needCA(ca), sol, reason),
+  },
+  {
+    name: "sell",
+    description: "Sell some or all of a token Octo holds. percent from 1 to 100 (default 100).",
+    inputSchema: {
+      type: "object",
+      properties: { ca: { type: "string", description: "Token mint address." }, percent: { type: "number", description: "Percent of the holding to sell (default 100)." } },
+      required: ["ca"],
+    },
+    run: async ({ ca, percent }) => sell(needCA(ca), percent ?? 100, "manual"),
+  },
+  {
+    name: "set_trading",
+    description: "Turn Octo's trading on or off (the kill switch). Exits on open positions keep running either way.",
+    inputSchema: { type: "object", properties: { enabled: { type: "boolean", description: "true to allow buys, false to pause them." } }, required: ["enabled"] },
+    run: async ({ enabled }) => {
+      tradingOn = !!enabled;
+      return { trading: tradingOn ? "on" : "paused" };
+    },
+  },
 ];
 
 // ---------------------------------------------------------------- MCP over HTTP (stateless JSON-RPC)
@@ -716,7 +1042,7 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://localhost");
 
   if (url.pathname === "/" || url.pathname === "/health") {
-    return send(res, 200, { name: "Octo Eyes", version: VERSION, ok: true, rpc: RPC_KIND, stream: streamState, launchesSeen: launches.length, watching: watched.size });
+    return send(res, 200, { name: "Octo Eyes", version: VERSION, ok: true, rpc: RPC_KIND, stream: streamState, launchesSeen: launches.length, watching: watched.size, wallet: wallet ? wallet.publicKey : walletError ? "error: " + walletError : "not set", trading: wallet ? (tradingOn ? "on" : "paused") : "off", openPositions: positions.size });
   }
   if (url.pathname !== MCP_PATH) return send(res, 404, { error: "Not found" });
   if (req.method === "GET" || req.method === "DELETE") return send(res, 405, { error: "Method not allowed" }, { allow: "POST" });
@@ -741,4 +1067,12 @@ server.listen(PORT, () => {
   console.log(`Octo Eyes listening on :${PORT}, MCP endpoint ${SECRET ? "/mcp/<secret>" : "/mcp"}`);
   if (process.env.OCTO_NO_STREAM !== "1") connectStream();
   else streamState = "off";
+  if (wallet) {
+    console.log(`Trading wallet ${wallet.publicKey}, trading ${tradingOn ? "on" : "paused"}`);
+    recoverPositions();
+    setInterval(() => exitLoop().catch(() => {}), 20_000);
+    // Keep the free Render plan awake while Octo holds money, so exits keep running.
+    const self = process.env.RENDER_EXTERNAL_URL;
+    if (self) setInterval(() => fetch(self + "/health").catch(() => {}), 10 * 60_000);
+  } else if (walletError) console.log("Trading wallet error: " + walletError);
 });

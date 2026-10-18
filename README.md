@@ -14,6 +14,10 @@ No dependencies. Needs Node 22 or newer.
 | `new_launches` | Newest pump.fun launches, live, with the dev's first buy |
 | `watch_wallet` | Start following a wallet's pump.fun buys and sells |
 | `watched_wallet_trades` | What the watched wallets just bought and sold |
+| `wallet_status` | Octo's trading wallet: balance, open positions, P&L, today's spend, limits |
+| `buy` | Buy a token with Octo's wallet, inside the hard limits |
+| `sell` | Sell some or all of a holding |
+| `set_trading` | The kill switch: pause or resume buys |
 
 ## Settings
 
@@ -22,6 +26,30 @@ No dependencies. Needs Node 22 or newer.
 | `OCTO_SECRET` | Random text that becomes part of the connector link, so strangers can't use your server. |
 | `SOLANA_RPC_URL` | Your Solana RPC link. Get a free one at helius.dev (looks like `https://mainnet.helius-rpc.com/?api-key=...`). The public default works but is slow and rate limited. |
 | `WATCH_WALLETS` | Optional. Wallets to always watch, separated by commas (smart money from First In, devs you follow). |
+
+## Trading (optional)
+
+Octo can trade with its own wallet. Use a brand-new wallet that holds only what you're willing to lose, never your main one.
+
+| Setting | Default | What it does |
+| --- | --- | --- |
+| `OCTO_WALLET_KEY` | none | The trading wallet's private key (base58, or the `[1,2,...]` array). Without it, trading is off. |
+| `TRADING_ENABLED` | off | Set to `true` to allow buys. You can also pause and resume from chat. |
+| `MAX_BUY_SOL` | 0.05 | Most SOL per buy. Larger requests are cut down to this. |
+| `DAILY_BUDGET_SOL` | 0.25 | Most SOL spent on buys per day (UTC). |
+| `MAX_OPEN_POSITIONS` | 3 | Most coins held at once. |
+| `RESERVE_SOL` | 0.02 | Always left in the wallet for fees. |
+| `TAKE_PROFIT_1_X` | 2 | Sells half at this multiple. |
+| `TAKE_PROFIT_2_X` | 3.5 | Sells the rest at this multiple. |
+| `STOP_LOSS_PCT` | 35 | Sells everything after this % drop. |
+| `MAX_HOLD_HOURS` | 12 | Closes positions held this long. |
+| `SLIPPAGE_PCT` | 15 | Slippage allowed per trade. |
+| `PRIORITY_FEE_SOL` | 0.0005 | Priority fee per trade. |
+
+Rules the server always applies: it never buys a coin with mint or freeze authority on, never signs a transaction paid by any other wallet, and runs exits every 20 seconds.
+Trades go through PumpPortal's trade API, which charges a small fee per trade; check pumpportal.fun for the current rate.
+Positions live in memory. After a restart, Octo rebuilds them from the coins in its wallet, with entry prices reset to the current price.
+While Octo holds coins it pings itself every 10 minutes so the free plan doesn't sleep through an exit.
 
 ## Deploy on Render (free)
 
