@@ -21,6 +21,7 @@ No dependencies. Needs Node 22 or newer.
 | `risk_dial` | Today's meme risk dial (0 to 1) and the market inputs behind it |
 | `trade_journal` | Closed trades, win rate and P&L (split by Octo's calls vs the auto baseline), plus every refused buy and why |
 | `scanner` | The fastest-filling pump.fun curves from the last 40 minutes |
+| `candles` | Price candles for a coin's main pool (1m to 1d), for charts |
 
 ## Settings
 

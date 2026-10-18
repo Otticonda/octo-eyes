@@ -17,7 +17,7 @@ const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const SECRET = (process.env.OCTO_SECRET || "").trim();
 const MCP_PATH = SECRET ? `/mcp/${SECRET}` : "/mcp";
 const STREAM_URL = "wss://pumpportal.fun/api/data";
-const VERSION = "3.1.0";
+const VERSION = "3.2.0";
 const PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
 const CA_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -299,6 +299,29 @@ async function geckoTerminal(ca) {
     pairAgeHours: a.pool_created_at ? round((Date.now() - Date.parse(a.pool_created_at)) / 3.6e6, 1) : null,
     otherPairs: pools.length - 1,
   };
+}
+
+// Price candles for a coin's main pool, oldest first (GeckoTerminal indexes pump.fun curves too).
+const TIMEFRAMES = { "1m": ["minute", 1], "5m": ["minute", 5], "15m": ["minute", 15], "1h": ["hour", 1], "4h": ["hour", 4], "1d": ["day", 1] };
+async function candles(ca, timeframe = "5m", limit = 120) {
+  const tf = TIMEFRAMES[timeframe] ? timeframe : "5m";
+  const n = Math.max(10, Math.min(300, Number(limit) || 120));
+  return cached(`ohlcv:${ca}:${tf}:${n}`, 30_000, async () => {
+    const g = await geckoTerminal(ca).catch(() => null);
+    if (!g?.pairAddress) return { found: false, note: "No pool with a chart for this coin yet." };
+    const [unit, agg] = TIMEFRAMES[tf];
+    const j = await getJSON(`https://api.geckoterminal.com/api/v2/networks/solana/pools/${g.pairAddress}/ohlcv/${unit}?aggregate=${agg}&limit=${n}&currency=usd&token=base`);
+    const list = j?.data?.attributes?.ohlcv_list || [];
+    return {
+      found: list.length > 0,
+      pool: g.pool,
+      pairAddress: g.pairAddress,
+      timeframe: tf,
+      candles: list
+        .map(([t, o, h, l, c, v]) => ({ t: t * 1000, o: Number(o), h: Number(h), l: Number(l), c: Number(c), v: Number(v) }))
+        .sort((a, b) => a.t - b.t),
+    };
+  });
 }
 
 async function marketData(ca) {
@@ -1608,6 +1631,20 @@ const TOOLS = [
     },
   },
   {
+    name: "candles",
+    description: "Price candles (open, high, low, close, volume in USD) for a Solana token's main pool, oldest first. Timeframes: 1m, 5m, 15m, 1h, 4h, 1d. Works for pump.fun coins once GeckoTerminal indexes them.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ca: { type: "string", description: "The token's contract address (mint)." },
+        timeframe: { type: "string", enum: Object.keys(TIMEFRAMES), description: "Candle size (default 5m)." },
+        limit: { type: "integer", minimum: 10, maximum: 300, description: "How many candles (default 120)." },
+      },
+      required: ["ca"],
+    },
+    run: async ({ ca, timeframe, limit }) => candles(needCA(ca), timeframe, limit),
+  },
+  {
     name: "risk_dial",
     description: "Today's meme risk dial (0 to 1): the share of green market conditions — BTC above its 200-day average, SOL above its 50-day, VIX under 22, US net liquidity rising over 4 weeks. Under 0.5 is a stand-down day and buys are refused; otherwise buy size is multiplied by the dial. Unreadable or stale inputs count as red. Recomputed every 3 hours.",
     inputSchema: { type: "object", properties: { fresh: { type: "boolean", description: "Recompute now instead of using the last reading." } } },
@@ -1623,6 +1660,8 @@ const TOOLS = [
     },
   },
 ];
+
+const WRITE_TOOLS = new Set(["buy", "sell", "set_trading", "watch_wallet"]);
 
 // ---------------------------------------------------------------- MCP over HTTP (stateless JSON-RPC)
 async function handleRpc(msg) {
@@ -1646,7 +1685,14 @@ async function handleRpc(msg) {
     case "ping":
       return ok({});
     case "tools/list":
-      return ok({ tools: TOOLS.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })) });
+      return ok({
+        tools: TOOLS.map(({ name, description, inputSchema }) => ({
+          name,
+          description,
+          inputSchema,
+          annotations: WRITE_TOOLS.has(name) ? { readOnlyHint: false, destructiveHint: name === "sell" } : { readOnlyHint: true },
+        })),
+      });
     case "tools/call": {
       const tool = TOOLS.find((t) => t.name === params?.name);
       if (!tool) return fail(-32602, `Unknown tool: ${params?.name}`);
