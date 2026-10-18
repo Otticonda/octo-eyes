@@ -17,7 +17,7 @@ const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const SECRET = (process.env.OCTO_SECRET || "").trim();
 const MCP_PATH = SECRET ? `/mcp/${SECRET}` : "/mcp";
 const STREAM_URL = "wss://pumpportal.fun/api/data";
-const VERSION = "3.10.0";
+const VERSION = "3.10.1";
 const PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
 const CA_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -1894,7 +1894,8 @@ async function recoverPositions() {
 // Octo's paper bank, open paper positions, closed trades, refused buys and fills are saved to a
 // private (secret) GitHub gist on the owner's account, and loaded back when the server starts.
 // Needs GITHUB_TOKEN with the "gist" permission. Without it, everything lives in memory only.
-const GH_TOKEN = (process.env.GITHUB_TOKEN || "").trim();
+const GH_TOKEN_NAME = ["GITHUB_TOKEN", "GH_TOKEN", "GITHUB_PAT", "GIST_TOKEN", "GITHUB_GIST_TOKEN"].find((k) => (process.env[k] || "").trim());
+const GH_TOKEN = GH_TOKEN_NAME ? process.env[GH_TOKEN_NAME].trim().replace(/^["']|["']$/g, "") : "";
 const GIST_DESC = "octo-eyes memory (paper bank and trade journal)";
 const STATE_FILE = "octo-memory.json";
 let gistId = (process.env.STATE_GIST_ID || "").trim() || null;
@@ -1910,8 +1911,10 @@ async function gh(path, opts = {}) {
   if (!res.ok) throw new Error(`GitHub answered ${res.status}${res.status === 401 ? " (check GITHUB_TOKEN)" : res.status === 404 ? " (token needs the gist permission)" : ""}`);
   return res.json();
 }
+let saveSoon = null;
 function markDirty() {
   stateDirty = true;
+  if (GH_TOKEN && !saveSoon) saveSoon = setTimeout(() => ((saveSoon = null), saveMemory().catch(() => {})), 3000);
 }
 function stateSnapshot() {
   return {
@@ -2218,7 +2221,7 @@ const TOOLS = [
         closedTrades: closedTrades.slice(0, n),
         openPositions: [...positions.values()],
         rejections: rejections.slice(0, Math.min(n, 50)),
-        memory: memory.on ? { savedTo: "private GitHub gist", gist: memory.gist, lastSaved: memory.savedAt, loadedAt: memory.loadedAt, error: memory.error } : { savedTo: null, note: "Add GITHUB_TOKEN (gist permission) on Render so trades survive restarts." },
+        memory: memory.on ? { savedTo: "private GitHub gist", tokenSetting: GH_TOKEN_NAME, gist: memory.gist, lastSaved: memory.savedAt, loadedAt: memory.loadedAt, error: memory.error } : { savedTo: null, note: "No GitHub token found. Add GITHUB_TOKEN (gist permission) on Render so trades survive restarts.", githubLikeSettings: Object.keys(process.env).filter((k) => /git|gist|token/i.test(k) && !/^(OCTO_SECRET|JUP_API_KEY)$/.test(k)) },
       };
     },
   },
