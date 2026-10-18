@@ -17,7 +17,7 @@ const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const SECRET = (process.env.OCTO_SECRET || "").trim();
 const MCP_PATH = SECRET ? `/mcp/${SECRET}` : "/mcp";
 const STREAM_URL = "wss://pumpportal.fun/api/data";
-const VERSION = "3.12.0";
+const VERSION = "3.13.0";
 const PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
 const CA_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -834,8 +834,35 @@ function recordTick(mint, priceSol, volSol) {
   let b = tradeBuf.get(mint);
   if (!b) tradeBuf.set(mint, (b = []));
   b.push({ t: Date.now(), p: priceSol * solUsdNow, s: priceSol, v: (volSol || 0) * solUsdNow });
+  if (positions.has(mint)) fastExit(mint, priceSol);
   const cut = Date.now() - 3 * 3.6e6; // keep 3 hours of ticks per followed coin
   while (b.length && (b[0].t < cut || b.length > 30000)) b.shift();
+}
+// Stops and take-profits run on every live trade tick, not on a timer, so a fast dump can't jump the stop.
+function fastExit(mint, priceSol) {
+  const pos = positions.get(mint);
+  if (!pos || pos.exiting || !(pos.entryPriceSol > 0) || !(priceSol > 0)) return;
+  const m = priceSol / pos.entryPriceSol;
+  let why = null;
+  let pct = 100;
+  if (m <= 1 - LIMITS.stopLossPct / 100) why = `stop loss at ${round((m - 1) * 100, 1)}%`;
+  else if (m >= LIMITS.takeProfit2X) why = `take profit at ${round(m, 2)}x`;
+  else if (!pos.soldHalf && m >= LIMITS.takeProfit1X) {
+    why = `first take profit at ${round(m, 2)}x`;
+    pct = 50;
+  }
+  if (!why) return;
+  pos.exiting = true;
+  sell(mint, pct, why, priceSol)
+    .then(() => {
+      const still = positions.get(mint);
+      if (still && pct === 50) still.soldHalf = true;
+    })
+    .catch((e) => logTrade({ side: "error", mint, error: "fast exit: " + e.message }))
+    .finally(() => {
+      const still = positions.get(mint);
+      if (still) still.exiting = false;
+    });
 }
 function note(message) {
   streamNotes.unshift({ at: new Date().toISOString(), message: String(message).slice(0, 200) });
@@ -1495,6 +1522,7 @@ async function buyInner(mint, sol, reason, score, source) {
       entrySignals: null,
     };
     positions.set(mint, pos);
+    followTrades(mint, true); // live ticks drive the stop and take-profits
     // Snapshot what the coin looked like at entry, for the journal (runs in the background).
     tokenReport(mint)
       .then((r) => {
@@ -1518,7 +1546,7 @@ async function buyInner(mint, sol, reason, score, source) {
   });
 }
 
-async function sell(mint, percent, why) {
+async function sell(mint, percent, why, atPriceSol = null) {
   needWallet();
   return withLock(async () => {
     rollDay();
@@ -1533,7 +1561,7 @@ async function sell(mint, percent, why) {
         positions.delete(mint);
         throw new Error("Octo's paper wallet holds none of this coin.");
       }
-      const price = await priceInSol(mint).catch(() => null);
+      const price = atPriceSol > 0 ? atPriceSol : await priceInSol(mint).catch(() => null);
       const ageH = (Date.now() - Date.parse(pos.openedAt)) / 3.6e6;
       if (!(price > 0)) {
         // A coin that can't be priced after the max hold is treated as dead: written off at zero.
@@ -1668,6 +1696,7 @@ async function volumeDying(mint) {
 async function exitLoop() {
   if ((!wallet && !PAPER) || !positions.size) return;
   for (const p of [...positions.values()]) {
+    if (p.exiting) continue;
     try {
       const v = await positionView(p);
       const ageH = (Date.now() - Date.parse(p.openedAt)) / 3.6e6;
@@ -1864,6 +1893,9 @@ async function autoPaperTick() {
       const why = [];
       if (!s) why.push("no report");
       else {
+        if (s.marketCapUsd != null && s.marketCapUsd < F.minMarketCapUsd) why.push(`market cap now $${Math.round(s.marketCapUsd)} (needs $${F.minMarketCapUsd})`);
+        if (F.onlyOnCurve && s.migrated) why.push("already migrated");
+        if (s.bondingCurveProgressPct != null && !s.migrated && s.bondingCurveProgressPct < F.minCurvePct) why.push(`curve now ${s.bondingCurveProgressPct}% (needs ${F.minCurvePct}%)`);
         if (s.volume5mUsd == null) why.push("no volume data");
         else if (s.volume5mUsd < F.minVolume5mUsd) why.push(`5m volume $${s.volume5mUsd} (needs $${F.minVolume5mUsd})`);
         if (s.top10HoldersPct != null && s.top10HoldersPct > F.maxTop10Pct) why.push(`top 10 hold ${s.top10HoldersPct}%`);
