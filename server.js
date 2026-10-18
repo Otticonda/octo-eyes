@@ -17,7 +17,7 @@ const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const SECRET = (process.env.OCTO_SECRET || "").trim();
 const MCP_PATH = SECRET ? `/mcp/${SECRET}` : "/mcp";
 const STREAM_URL = "wss://pumpportal.fun/api/data";
-const VERSION = "3.9.0";
+const VERSION = "3.10.0";
 const PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
 const CA_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -1335,7 +1335,13 @@ function compactSignals(r) {
   if (!r) return null;
   const m = r.market || {};
   const h1 = m.stats1h || {};
+  const m5 = m.stats5m || {};
+  const vol = (x) => (x.buyVolumeUsd != null || x.sellVolumeUsd != null ? round((x.buyVolumeUsd || 0) + (x.sellVolumeUsd || 0), 0) : null);
   return {
+    volume5mUsd: vol(m5),
+    volume1hUsd: vol(h1),
+    buys5m: m5.buys ?? null,
+    sells5m: m5.sells ?? null,
     marketCapUsd: m.marketCapUsd ?? r.pumpfun?.marketCapUsd ?? null,
     liquidityUsd: m.liquidityUsd ?? null,
     holders: m.holders ?? null,
@@ -1802,6 +1808,7 @@ const AUTO_FILTER = {
   maxAgeMin: numEnv("AUTO_MAX_AGE_MIN", 30),
   minMarketCapUsd: numEnv("AUTO_MIN_MCAP_USD", 7000),
   maxTop10Pct: numEnv("AUTO_MAX_TOP10_PCT", 30),
+  minVolume5mUsd: numEnv("AUTO_MIN_VOL5M_USD", 5000),
   minCurvePct: numEnv("AUTO_MIN_CURVE_PCT", 50),
   onlyOnCurve: !/^(0|false|off|no)$/i.test(process.env.AUTO_ONLY_ON_CURVE || ""),
   everySec: numEnv("AUTO_EVERY_SEC", 60),
@@ -1837,6 +1844,8 @@ async function autoPaperTick() {
       const why = [];
       if (!s) why.push("no report");
       else {
+        if (s.volume5mUsd == null) why.push("no volume data");
+        else if (s.volume5mUsd < F.minVolume5mUsd) why.push(`5m volume $${s.volume5mUsd} (needs $${F.minVolume5mUsd})`);
         if (s.top10HoldersPct != null && s.top10HoldersPct > F.maxTop10Pct) why.push(`top 10 hold ${s.top10HoldersPct}%`);
         if (s.risk !== "low") why.push(`rug radar ${s.risk} (${s.riskScore})`);
         if (s.devHoldingPct != null && s.devHoldingPct > 5) why.push(`dev holds ${s.devHoldingPct}%`);
@@ -1847,7 +1856,7 @@ async function autoPaperTick() {
         continue;
       }
       try {
-        await buy(pick.mint, LIMITS.maxBuySol, `auto: final stretch, curve ${pick.bondingCurveProgressPct}%, ${Math.round(pick.ageMinutes)}m old, rug radar low`, null, "auto");
+        await buy(pick.mint, LIMITS.maxBuySol, `auto: final stretch, curve ${pick.bondingCurveProgressPct}%, ${Math.round(pick.ageMinutes)}m old, 5m volume $${s.volume5mUsd}, rug radar low`, null, "auto");
         return (autoState.lastResult = `bought ${pick.symbol || pick.mint}`);
       } catch (e) {
         return (autoState.lastResult = "buy refused: " + e.message);

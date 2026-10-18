@@ -70,6 +70,7 @@ reports on up to 3 matching coins, and paper-buys the first that also passes the
 | `AUTO_MIN_AGE_MIN` / `AUTO_MAX_AGE_MIN` | 3 / 30 | Coin age window in minutes. |
 | `AUTO_MIN_MCAP_USD` | 7000 | Minimum market cap. |
 | `AUTO_MAX_TOP10_PCT` | 30 | Most the top 10 holders may own. |
+| `AUTO_MIN_VOL5M_USD` | 5000 | Least USD traded in the last 5 minutes (Jupiter's live stats). |
 | `AUTO_MIN_CURVE_PCT` | 50 | "Final stretch": how full the pump.fun curve must be. |
 | `AUTO_ONLY_ON_CURVE` | on | Skip coins that already migrated. |
 | `AUTO_EVERY_SEC` | 60 | How often the baseline looks. |
