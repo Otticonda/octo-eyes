@@ -17,7 +17,7 @@ const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const SECRET = (process.env.OCTO_SECRET || "").trim();
 const MCP_PATH = SECRET ? `/mcp/${SECRET}` : "/mcp";
 const STREAM_URL = "wss://pumpportal.fun/api/data";
-const VERSION = "3.0.0";
+const VERSION = "3.0.1";
 const PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
 const CA_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -577,7 +577,7 @@ async function devCheck(creator) {
 
 // Top holders whose wallets are brand new: a classic sign of insiders splitting supply.
 async function freshHolders(topHolders) {
-  const real = (topHolders || []).filter((h) => h.owner && h.label !== "pump.fun bonding curve").slice(0, 10);
+  const real = (topHolders || []).filter((h) => h.owner && h.label !== "pump.fun bonding curve" && h.label !== "liquidity pool").slice(0, 10);
   const checks = await pmap(real, (h) => rpc("getSignaturesForAddress", [h.owner, { limit: 20 }]).then((r) => ({ ...h, txs: r?.length ?? 0 })));
   const fresh = checks.filter((h) => h && h.txs < 12);
   return { checked: real.length, freshWallets: fresh.length, freshPct: round(fresh.reduce((t, h) => t + (h.pct || 0), 0), 2), list: fresh.map((h) => ({ wallet: h.owner, pct: h.pct, txs: h.txs })) };
@@ -630,6 +630,23 @@ async function tokenReport(ca) {
     safety = await safetyCheck(ca, hints);
   } catch (e) {
     safety = { error: e.message };
+  }
+  // Label the DEX pool among holders so it doesn't count as concentration.
+  const pair = mkt.status === "fulfilled" ? mkt.value?.pairAddress : null;
+  if (pair && safety?.topHolders) {
+    let changed = false;
+    safety.topHolders.forEach((h) => {
+      if (h.owner === pair && h.label !== "liquidity pool") {
+        h.label = "liquidity pool";
+        changed = true;
+      }
+    });
+    if (changed) {
+      const real = safety.topHolders.filter((h) => !h.label || h.label === "creator (dev)");
+      safety.top10HoldersPct = round(real.slice(0, 10).reduce((t, h) => t + (h.pct || 0), 0), 2);
+      safety.flags = (safety.flags || []).filter((f) => !f.startsWith("Top 10 holders"));
+      if (safety.top10HoldersPct > 30) safety.flags.push(`Top 10 holders own ${safety.top10HoldersPct}% (excluding the bonding curve and pool): concentrated.`);
+    }
   }
   let radar;
   try {
