@@ -17,7 +17,7 @@ const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const SECRET = (process.env.OCTO_SECRET || "").trim();
 const MCP_PATH = SECRET ? `/mcp/${SECRET}` : "/mcp";
 const STREAM_URL = "wss://pumpportal.fun/api/data";
-const VERSION = "3.8.0";
+const VERSION = "3.8.1";
 const PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
 const CA_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -810,7 +810,7 @@ function recordTick(mint, priceSol, volSol) {
   }
   let b = tradeBuf.get(mint);
   if (!b) tradeBuf.set(mint, (b = []));
-  b.push({ t: Date.now(), p: priceSol * solUsdNow, v: (volSol || 0) * solUsdNow });
+  b.push({ t: Date.now(), p: priceSol * solUsdNow, s: priceSol, v: (volSol || 0) * solUsdNow });
   const cut = Date.now() - 15 * 60_000;
   while (b.length && (b[0].t < cut || b.length > 6000)) b.shift();
 }
@@ -1533,8 +1533,13 @@ async function sell(mint, percent, why) {
   });
 }
 
+// Latest price from the live 1s feed, if it saw a trade in the last 2 minutes.
+function livePriceSol(mint) {
+  const last = tradeBuf.get(mint)?.at(-1);
+  return last?.s > 0 && Date.now() - last.t < 120_000 ? last.s : null;
+}
 async function positionView(p) {
-  const price = await priceInSol(p.mint).catch(() => null);
+  const price = livePriceSol(p.mint) ?? (await priceInSol(p.mint).catch(() => null));
   if (price != null) solPriceUsd().then((u) => u && recordPrice(p.mint, price * u)).catch(() => {});
   const value = price != null ? price * p.tokens : null;
   const multiple = p.entryPriceSol && price ? price / p.entryPriceSol : null;
@@ -1560,6 +1565,7 @@ async function walletStatus() {
           autoPaper: AUTO_PAPER ? "on" : "off",
         }
       : {}),
+    solUsd: solUsdNow ?? (await solPriceUsd().catch(() => null)),
     trading: tradingOn ? "on" : "paused",
     spentToday: round(spentToday, 3),
     realizedTodaySol: round(realizedToday, 4),
