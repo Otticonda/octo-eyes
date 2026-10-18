@@ -17,7 +17,7 @@ const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const SECRET = (process.env.OCTO_SECRET || "").trim();
 const MCP_PATH = SECRET ? `/mcp/${SECRET}` : "/mcp";
 const STREAM_URL = "wss://pumpportal.fun/api/data";
-const VERSION = "3.2.0";
+const VERSION = "3.3.0";
 const PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
 const CA_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -301,25 +301,79 @@ async function geckoTerminal(ca) {
   };
 }
 
-// Price candles for a coin's main pool, oldest first (GeckoTerminal indexes pump.fun curves too).
+// Octo's own price readings (bonding curves from the scanner, held coins from the exit loop),
+// so brand-new coins get a chart before GeckoTerminal indexes them.
+const priceHistory = new Map(); // mint -> [{t, p (USD), s (SOL in curve)}]
+function recordPrice(mint, priceUsd, solInCurve = null) {
+  if (!(priceUsd > 0)) return;
+  let h = priceHistory.get(mint);
+  if (!h) priceHistory.set(mint, (h = []));
+  const t = Date.now();
+  if (h.length && t - h[h.length - 1].t < 5000) h[h.length - 1] = { t, p: priceUsd, s: solInCurve };
+  else h.push({ t, p: priceUsd, s: solInCurve });
+  if (h.length > 600) h.shift();
+}
+function prunePriceHistory() {
+  const cut = Date.now() - 3 * 3.6e6;
+  for (const [m, h] of priceHistory) if (!h.length || h[h.length - 1].t < cut) priceHistory.delete(m);
+}
+const TF_MS = { "1m": 60e3, "5m": 300e3, "15m": 900e3, "1h": 3.6e6, "4h": 14.4e6, "1d": 86.4e6 };
+function ownCandles(ca, tf, n, solUsd) {
+  const h = priceHistory.get(ca);
+  if (!h || h.length < 2) return [];
+  const ms = TF_MS[tf] || 60e3;
+  const out = [];
+  let prevS = null;
+  for (const x of h) {
+    const b = Math.floor(x.t / ms) * ms;
+    let c = out[out.length - 1];
+    if (!c || c.t !== b) {
+      c = { t: b, o: c ? c.c : x.p, h: Math.max(x.p, c ? c.c : x.p), l: Math.min(x.p, c ? c.c : x.p), c: x.p, v: 0 };
+      out.push(c);
+    }
+    c.h = Math.max(c.h, x.p);
+    c.l = Math.min(c.l, x.p);
+    c.c = x.p;
+    if (prevS != null && x.s != null && solUsd) c.v += Math.abs(x.s - prevS) * solUsd;
+    prevS = x.s;
+  }
+  return out.slice(-n);
+}
+
+// Price candles for a coin, oldest first: GeckoTerminal's chart of its main pool,
+// or Octo's own curve readings when that has less (brand-new pump.fun coins).
 const TIMEFRAMES = { "1m": ["minute", 1], "5m": ["minute", 5], "15m": ["minute", 15], "1h": ["hour", 1], "4h": ["hour", 4], "1d": ["day", 1] };
 async function candles(ca, timeframe = "5m", limit = 120) {
   const tf = TIMEFRAMES[timeframe] ? timeframe : "5m";
   const n = Math.max(10, Math.min(300, Number(limit) || 120));
-  return cached(`ohlcv:${ca}:${tf}:${n}`, 30_000, async () => {
-    const g = await geckoTerminal(ca).catch(() => null);
-    if (!g?.pairAddress) return { found: false, note: "No pool with a chart for this coin yet." };
-    const [unit, agg] = TIMEFRAMES[tf];
-    const j = await getJSON(`https://api.geckoterminal.com/api/v2/networks/solana/pools/${g.pairAddress}/ohlcv/${unit}?aggregate=${agg}&limit=${n}&currency=usd&token=base`);
-    const list = j?.data?.attributes?.ohlcv_list || [];
+  return cached(`ohlcv:${ca}:${tf}:${n}`, 20_000, async () => {
+    const solUsd = await solPriceUsd().catch(() => null);
+    const own = ownCandles(ca, tf, n, solUsd);
+    let gecko = [];
+    let pool = null;
+    let geckoError = null;
+    try {
+      const g = await geckoTerminal(ca);
+      if (g?.pairAddress) {
+        pool = { name: g.pool, pairAddress: g.pairAddress };
+        const [unit, agg] = TIMEFRAMES[tf];
+        const j = await getJSON(`https://api.geckoterminal.com/api/v2/networks/solana/pools/${g.pairAddress}/ohlcv/${unit}?aggregate=${agg}&limit=${n}&currency=usd&token=${ca}`);
+        gecko = (j?.data?.attributes?.ohlcv_list || [])
+          .map(([t, o, h, l, c, v]) => ({ t: t * 1000, o: Number(o), h: Number(h), l: Number(l), c: Number(c), v: Number(v) }))
+          .sort((a, b) => a.t - b.t);
+      }
+    } catch (e) {
+      geckoError = e.message;
+    }
+    const useOwn = own.length > gecko.length;
+    const list = useOwn ? own : gecko;
     return {
       found: list.length > 0,
-      pool: g.pool,
-      pairAddress: g.pairAddress,
+      source: list.length ? (useOwn ? "Octo's own curve readings" : "GeckoTerminal") : null,
+      pool,
       timeframe: tf,
-      candles: list
-        .map(([t, o, h, l, c, v]) => ({ t: t * 1000, o: Number(o), h: Number(h), l: Number(l), c: Number(c), v: Number(v) }))
-        .sort((a, b) => a.t - b.t),
+      candles: list,
+      note: list.length ? undefined : "No chart for this coin yet." + (geckoError ? " GeckoTerminal: " + geckoError : ""),
     };
   });
 }
@@ -1156,6 +1210,7 @@ async function sell(mint, percent, why) {
 
 async function positionView(p) {
   const price = await priceInSol(p.mint).catch(() => null);
+  if (price != null) solPriceUsd().then((u) => u && recordPrice(p.mint, price * u)).catch(() => {});
   const value = price != null ? price * p.tokens : null;
   const multiple = p.entryPriceSol && price ? price / p.entryPriceSol : null;
   return { ...p, priceSol: price, valueSol: value != null ? round(value, 4) : null, multiple: multiple != null ? round(multiple, 2) : null, pnlPct: multiple != null ? round((multiple - 1) * 100, 1) : null };
@@ -1418,22 +1473,23 @@ async function recoverPositions() {
 }
 
 // ---------------------------------------------------------------- coin scanner
-// Every 45s, reads the bonding curve of each coin launched in the last 40 minutes and tracks its momentum.
+// Every 20s, reads the bonding curve of each coin launched in the last 40 minutes and tracks its momentum.
 const scan = new Map();
 async function scanTick() {
   const now = Date.now();
   const live = launches.filter((l) => {
     const age = now - Date.parse(l.at);
-    return age > 45_000 && age < 40 * 60_000;
+    return age > 20_000 && age < 40 * 60_000;
   }).slice(0, 100);
   if (!live.length) return;
   const keys = live.map((l) => l.bondingCurve || findPDA([Buffer.from("bonding-curve"), pubkeyBytes(l.mint)], PUMP_PROGRAM));
-  const r = await rpc("getMultipleAccounts", [keys, { encoding: "base64" }]);
+  const [r, solUsd] = await Promise.all([rpc("getMultipleAccounts", [keys, { encoding: "base64" }]), solPriceUsd().catch(() => null)]);
   (r?.value || []).forEach((acc, i) => {
     if (!acc?.data) return;
     const p = parseCurve(Buffer.from(acc.data[0], "base64"));
     if (!p) return;
     const l = live[i];
+    if (solUsd && p.marketCapSol != null && !p.migrated) recordPrice(l.mint, (p.marketCapSol / 1e9) * solUsd, p.solInCurve);
     const prev = scan.get(l.mint);
     scan.set(l.mint, {
       mint: l.mint,
@@ -1449,6 +1505,7 @@ async function scanTick() {
     });
   });
   for (const [m, e] of scan) if (now - Date.parse(e.launchedAt) > 60 * 60_000) scan.delete(m);
+  prunePriceHistory();
 }
 
 async function scannerPicks(limit = 5) {
@@ -1759,7 +1816,7 @@ server.listen(PORT, () => {
   console.log(`Octo Eyes listening on :${PORT}, MCP endpoint ${SECRET ? "/mcp/<secret>" : "/mcp"}`);
   if (process.env.OCTO_NO_STREAM !== "1") {
     connectStream();
-    setInterval(() => scanTick().catch(() => {}), 45_000);
+    setInterval(() => scanTick().catch(() => {}), 20_000);
   } else streamState = "off";
   if (PAPER) {
     console.log(`Paper mode: ${PAPER_START_SOL} SOL simulated bank, trading ${tradingOn ? "on" : "paused"}, auto paper ${AUTO_PAPER ? "on" : "off"}`);
