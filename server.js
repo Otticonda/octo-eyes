@@ -17,7 +17,7 @@ const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const SECRET = (process.env.OCTO_SECRET || "").trim();
 const MCP_PATH = SECRET ? `/mcp/${SECRET}` : "/mcp";
 const STREAM_URL = "wss://pumpportal.fun/api/data";
-const VERSION = "3.4.1";
+const VERSION = "3.5.0";
 const PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
 const CA_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -352,12 +352,12 @@ async function candles(ca, timeframe = "5m", limit = 120) {
     const list = secondCandles(ca, n);
     return {
       found: list.length > 0,
-      source: list.length ? "live trades (PumpPortal)" : null,
+      source: list.length ? "live bonding-curve updates" : null,
       timeframe: "1s",
       following: true,
       candles: list,
-      note: list.length ? undefined : wasFollowing ? "No trades on this coin in the last 15 minutes." : "Started following this coin's trades; 1s candles appear as trades come in.",
-      stream: { state: streamState, tradeMessages: tradeMsgs, onFollowedCoins: followedTradeMsgs, droppedNoSolPrice: droppedNoPrice, solUsd: solUsdNow, following: tradeSubs.size, replies: streamNotes.slice(0, 4) },
+      note: list.length ? undefined : wasFollowing ? "No trades on this coin in the last 15 minutes." : "Started following this coin's curve; 1s candles appear as trades come in. Migrated coins have no curve to follow.",
+      feed: { curveFeed: curveWsState, rpc: RPC_KIND, curveUpdates: curveTicks, following: tradeSubs.size, subscribed: subToMint.size, droppedNoSolPrice: droppedNoPrice, solUsd: solUsdNow, notes: streamNotes.slice(0, 3) },
     };
   }
   if (ca === "So11111111111111111111111111111111111111112") {
@@ -795,24 +795,128 @@ function followTrades(mint, keep = false) {
     if (oldest) {
       tradeSubs.delete(oldest[0]);
       tradeBuf.delete(oldest[0]);
-      if (ws && ws.readyState === 1) ws.send(JSON.stringify({ method: "unsubscribeTokenTrade", keys: [oldest[0]] }));
+      unsubscribeCurve(oldest[0]);
     }
   }
-  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
+  subscribeCurve(mint);
 }
-function recordTrade(m) {
-  const vSol = Number(m.vSolInBondingCurve), vTok = Number(m.vTokensInBondingCurve);
-  const priceSol = vSol > 0 && vTok > 0 ? vSol / vTok : Number(m.marketCapSol) > 0 ? Number(m.marketCapSol) / 1e9 : null;
+// One price point per curve change (every trade moves the curve). volSol = SOL that moved.
+function recordTick(mint, priceSol, volSol) {
   if (!(priceSol > 0) || !solUsdNow) {
     droppedNoPrice++;
     return;
   }
-  let b = tradeBuf.get(m.mint);
-  if (!b) tradeBuf.set(m.mint, (b = []));
-  b.push({ t: Date.now(), p: priceSol * solUsdNow, v: (Number(m.solAmount) || 0) * solUsdNow });
+  let b = tradeBuf.get(mint);
+  if (!b) tradeBuf.set(mint, (b = []));
+  b.push({ t: Date.now(), p: priceSol * solUsdNow, v: (volSol || 0) * solUsdNow });
   const cut = Date.now() - 15 * 60_000;
   while (b.length && (b[0].t < cut || b.length > 6000)) b.shift();
 }
+
+// ---- live curve feed: the RPC's websocket pushes every change to a coin's bonding curve.
+// Free (no PumpPortal key needed). Works while a coin is still on its pump.fun curve.
+const RPC_WS = RPC_URL.replace(/^http/i, "ws");
+let curveWs = null;
+let curveWsState = "off";
+let curveTicks = 0;
+let rpcMsgId = 1;
+const curveSubs = new Map(); // mint -> { curve, subId, lastRealSol }
+const subToMint = new Map();
+const pendingSubs = new Map(); // request id -> mint
+const curveOpen = () => curveWs && curveWs.readyState === 1;
+
+function connectCurveWs() {
+  if (typeof WebSocket === "undefined") {
+    curveWsState = "unavailable (needs Node 22+)";
+    return;
+  }
+  try {
+    curveWs = new WebSocket(RPC_WS);
+  } catch (e) {
+    curveWsState = "error: " + e.message;
+    setTimeout(connectCurveWs, 10_000);
+    return;
+  }
+  curveWsState = "connecting";
+  curveWs.addEventListener("open", () => {
+    curveWsState = "live";
+    subToMint.clear();
+    pendingSubs.clear();
+    for (const c of curveSubs.values()) c.subId = null;
+    for (const mint of tradeSubs.keys()) subscribeCurve(mint, true);
+  });
+  curveWs.addEventListener("message", (ev) => {
+    let m;
+    try {
+      m = JSON.parse(typeof ev.data === "string" ? ev.data : ev.data.toString());
+    } catch {
+      return;
+    }
+    if (m.id != null && pendingSubs.has(m.id)) {
+      const mint = pendingSubs.get(m.id);
+      pendingSubs.delete(m.id);
+      if (m.error) {
+        streamNotes.unshift({ at: new Date().toISOString(), message: "RPC: " + String(m.error.message || JSON.stringify(m.error)).slice(0, 180) });
+        if (streamNotes.length > 8) streamNotes.pop();
+        return;
+      }
+      const c = curveSubs.get(mint);
+      if (c && tradeSubs.has(mint)) {
+        c.subId = m.result;
+        subToMint.set(m.result, mint);
+      } else if (curveOpen()) curveWs.send(JSON.stringify({ jsonrpc: "2.0", id: rpcMsgId++, method: "accountUnsubscribe", params: [m.result] }));
+      return;
+    }
+    if (m.method === "accountNotification") {
+      const mint = subToMint.get(m.params?.subscription);
+      const v = m.params?.result?.value;
+      if (!mint || !v?.data?.[0]) return;
+      const d = Buffer.from(v.data[0], "base64");
+      if (d.length < 49) return;
+      const vTok = Number(d.readBigUInt64LE(8));
+      const vSol = Number(d.readBigUInt64LE(16));
+      const rSol = Number(d.readBigUInt64LE(32));
+      if (!(vTok > 0)) return;
+      const c = curveSubs.get(mint);
+      const moved = c?.lastRealSol != null ? Math.abs(rSol - c.lastRealSol) / 1e9 : 0;
+      if (c) c.lastRealSol = rSol;
+      curveTicks++;
+      recordTick(mint, vSol / 1e9 / (vTok / 1e6), moved);
+    }
+  });
+  curveWs.addEventListener("close", () => {
+    curveWsState = "reconnecting";
+    setTimeout(connectCurveWs, 5000);
+  });
+  curveWs.addEventListener("error", () => {
+    curveWsState = "reconnecting";
+  });
+}
+function subscribeCurve(mint, resend = false) {
+  let c = curveSubs.get(mint);
+  if (!c) {
+    try {
+      c = { curve: findPDA([Buffer.from("bonding-curve"), pubkeyBytes(mint)], PUMP_PROGRAM), subId: null, lastRealSol: null };
+    } catch {
+      return;
+    }
+    curveSubs.set(mint, c);
+  } else if (!resend && c.subId != null) return;
+  if (!curveOpen()) return; // subscribed when the socket opens
+  const id = rpcMsgId++;
+  pendingSubs.set(id, mint);
+  curveWs.send(JSON.stringify({ jsonrpc: "2.0", id, method: "accountSubscribe", params: [c.curve, { encoding: "base64", commitment: "confirmed" }] }));
+}
+function unsubscribeCurve(mint) {
+  const c = curveSubs.get(mint);
+  if (!c) return;
+  curveSubs.delete(mint);
+  if (c.subId != null) {
+    subToMint.delete(c.subId);
+    if (curveOpen()) curveWs.send(JSON.stringify({ jsonrpc: "2.0", id: rpcMsgId++, method: "accountUnsubscribe", params: [c.subId] }));
+  }
+}
+
 // 1-second candles; seconds with no trade carry the last close so time stays even.
 function secondCandles(mint, n) {
   const b = tradeBuf.get(mint);
@@ -863,7 +967,6 @@ function connectStream() {
     streamSince = new Date().toISOString();
     ws.send(JSON.stringify({ method: "subscribeNewToken" }));
     if (watched.size) ws.send(JSON.stringify({ method: "subscribeAccountTrade", keys: [...watched] }));
-    if (tradeSubs.size) ws.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [...tradeSubs.keys()] }));
   });
   ws.addEventListener("message", (ev) => {
     let m;
@@ -894,7 +997,6 @@ function connectStream() {
       });
       if (launches.length > 300) launches.pop();
     } else if (m.txType === "buy" || m.txType === "sell") {
-      if (m.mint && tradeSubs.has(m.mint)) recordTrade(m);
       if (!watched.has(m.traderPublicKey)) return;
       walletTrades.unshift({
         wallet: m.traderPublicKey,
@@ -1801,7 +1903,7 @@ const TOOLS = [
   },
   {
     name: "candles",
-    description: "Price candles (open, high, low, close, volume in USD) for a Solana token, oldest first. Timeframes: 1s (built live from every pump.fun trade, last 15 minutes), 1m, 5m, 15m, 1h, 4h, 1d (GeckoTerminal, or Octo's own curve readings for brand-new coins).",
+    description: "Price candles (open, high, low, close, volume in USD) for a Solana token, oldest first. Timeframes: 1s (built live from every change to the coin's pump.fun bonding curve, last 15 minutes, while it is still on the curve), 1m, 5m, 15m, 1h, 4h, 1d (GeckoTerminal, or Octo's own curve readings for brand-new coins).",
     inputSchema: {
       type: "object",
       properties: {
@@ -1903,7 +2005,7 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://localhost");
 
   if (url.pathname === "/" || url.pathname === "/health") {
-    return send(res, 200, { name: "Octo Eyes", version: VERSION, ok: true, rpc: RPC_KIND, stream: streamState, tradeMessages: tradeMsgs, followingTrades: tradeSubs.size, streamReplies: streamNotes.slice(0, 3), launchesSeen: launches.length, watching: watched.size, mode: PAPER ? "paper" : "live", wallet: PAPER ? "paper" : wallet ? wallet.publicKey : walletError ? "error: " + walletError : "not set", trading: PAPER || wallet ? (tradingOn ? "on" : "paused") : "off", autoPaper: AUTO_PAPER ? "on" : "off", memeDial: dialCache?.memeDial ?? null, openPositions: positions.size, scannerTracking: scan.size, journalTrades: closedTrades.length });
+    return send(res, 200, { name: "Octo Eyes", version: VERSION, ok: true, rpc: RPC_KIND, stream: streamState, curveFeed: curveWsState, curveUpdates: curveTicks, followingCurves: subToMint.size, feedNotes: streamNotes.slice(0, 3), launchesSeen: launches.length, watching: watched.size, mode: PAPER ? "paper" : "live", wallet: PAPER ? "paper" : wallet ? wallet.publicKey : walletError ? "error: " + walletError : "not set", trading: PAPER || wallet ? (tradingOn ? "on" : "paused") : "off", autoPaper: AUTO_PAPER ? "on" : "off", memeDial: dialCache?.memeDial ?? null, openPositions: positions.size, scannerTracking: scan.size, journalTrades: closedTrades.length });
   }
   if (url.pathname !== MCP_PATH) return send(res, 404, { error: "Not found" });
   if (req.method === "GET" || req.method === "DELETE") return send(res, 405, { error: "Method not allowed" }, { allow: "POST" });
@@ -1928,6 +2030,7 @@ server.listen(PORT, () => {
   console.log(`Octo Eyes listening on :${PORT}, MCP endpoint ${SECRET ? "/mcp/<secret>" : "/mcp"}`);
   if (process.env.OCTO_NO_STREAM !== "1") {
     connectStream();
+    connectCurveWs();
     setInterval(() => scanTick().catch(() => {}), 20_000);
   } else streamState = "off";
   if (PAPER) {
