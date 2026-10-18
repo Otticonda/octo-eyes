@@ -17,7 +17,7 @@ const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const SECRET = (process.env.OCTO_SECRET || "").trim();
 const MCP_PATH = SECRET ? `/mcp/${SECRET}` : "/mcp";
 const STREAM_URL = "wss://pumpportal.fun/api/data";
-const VERSION = "1.1.0";
+const VERSION = "1.2.0";
 const PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
 const CA_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -187,32 +187,93 @@ function needCA(ca) {
 }
 
 // ---------------------------------------------------------------- DexScreener
+async function dexScreener(ca) {
+  const j = await getJSON(`https://api.dexscreener.com/latest/dex/tokens/${ca}`);
+  const pairs = (j.pairs || []).filter((p) => p.chainId === "solana");
+  if (!pairs.length) return null;
+  pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
+  const p = pairs[0];
+  return {
+    found: true,
+    source: "DexScreener",
+    name: p.baseToken?.name ?? null,
+    symbol: p.baseToken?.symbol ?? null,
+    dex: p.dexId ?? null,
+    pairAddress: p.pairAddress ?? null,
+    url: p.url ?? null,
+    priceUsd: p.priceUsd ? Number(p.priceUsd) : null,
+    marketCapUsd: p.marketCap ?? p.fdv ?? null,
+    liquidityUsd: p.liquidity?.usd ?? null,
+    volumeUsd: p.volume ?? null,
+    priceChangePct: p.priceChange ?? null,
+    txns: p.txns ?? null,
+    pairAgeHours: p.pairCreatedAt ? round((Date.now() - p.pairCreatedAt) / 3.6e6, 1) : null,
+    paidBoostsActive: p.boosts?.active ?? 0,
+    websites: (p.info?.websites || []).map((w) => w.url),
+    socials: (p.info?.socials || []).map((s) => `${s.type}: ${s.url}`),
+    otherPairs: pairs.length - 1,
+  };
+}
+
+// Backup source when DexScreener rate-limits the server.
+async function geckoTerminal(ca) {
+  const j = await getJSON(`https://api.geckoterminal.com/api/v2/networks/solana/tokens/${ca}/pools?page=1`);
+  const pools = (j.data || []).map((d) => d.attributes || {}).filter(Boolean);
+  if (!pools.length) return null;
+  pools.sort((a, b) => Number(b.reserve_in_usd || 0) - Number(a.reserve_in_usd || 0));
+  const a = pools[0];
+  const num = (v) => (v == null || v === "" ? null : Number(v));
+  const pick = (o, f) => (o ? Object.fromEntries(Object.entries(o).map(([k, v]) => [k, f(v)])) : null);
+  return {
+    found: true,
+    source: "GeckoTerminal",
+    pool: a.name ?? null,
+    pairAddress: a.address ?? null,
+    url: a.address ? `https://www.geckoterminal.com/solana/pools/${a.address}` : null,
+    priceUsd: num(a.base_token_price_usd),
+    marketCapUsd: num(a.market_cap_usd) ?? num(a.fdv_usd),
+    liquidityUsd: num(a.reserve_in_usd),
+    volumeUsd: pick(a.volume_usd, num),
+    priceChangePct: pick(a.price_change_percentage, num),
+    txns: a.transactions ?? null,
+    pairAgeHours: a.pool_created_at ? round((Date.now() - Date.parse(a.pool_created_at)) / 3.6e6, 1) : null,
+    otherPairs: pools.length - 1,
+  };
+}
+
 async function marketData(ca) {
   return cached("mkt:" + ca, 20_000, async () => {
-    const j = await getJSON(`https://api.dexscreener.com/latest/dex/tokens/${ca}`);
-    const pairs = (j.pairs || []).filter((p) => p.chainId === "solana");
-    if (!pairs.length) return { found: false, note: "No trading pairs on DexScreener yet. A brand-new pump.fun coin may not be indexed yet." };
-    pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
-    const p = pairs[0];
-    return {
-      found: true,
-      name: p.baseToken?.name ?? null,
-      symbol: p.baseToken?.symbol ?? null,
-      dex: p.dexId ?? null,
-      pairAddress: p.pairAddress ?? null,
-      url: p.url ?? null,
-      priceUsd: p.priceUsd ? Number(p.priceUsd) : null,
-      marketCapUsd: p.marketCap ?? p.fdv ?? null,
-      liquidityUsd: p.liquidity?.usd ?? null,
-      volumeUsd: p.volume ?? null,
-      priceChangePct: p.priceChange ?? null,
-      txns: p.txns ?? null,
-      pairAgeHours: p.pairCreatedAt ? round((Date.now() - p.pairCreatedAt) / 3.6e6, 1) : null,
-      paidBoostsActive: p.boosts?.active ?? 0,
-      websites: (p.info?.websites || []).map((w) => w.url),
-      socials: (p.info?.socials || []).map((s) => `${s.type}: ${s.url}`),
-      otherPairs: pairs.length - 1,
-    };
+    const errors = [];
+    try {
+      const d = await dexScreener(ca);
+      if (d) return d;
+    } catch (e) {
+      errors.push("DexScreener: " + e.message);
+    }
+    try {
+      const g = await geckoTerminal(ca);
+      if (g) return g;
+    } catch (e) {
+      errors.push("GeckoTerminal: " + e.message);
+    }
+    if (errors.length === 2) return { found: false, error: errors.join("; ") };
+    return { found: false, note: "No trading pools yet. A pump.fun coin still on its bonding curve has no DEX pool until it migrates.", errors: errors.length ? errors : undefined };
+  });
+}
+
+async function solPriceUsd() {
+  return cached("solusd", 60_000, async () => {
+    const SOL = "So11111111111111111111111111111111111111112";
+    try {
+      const j = await getJSON(`https://api.geckoterminal.com/api/v2/simple/networks/solana/token_price/${SOL}`);
+      const v = Number(j?.data?.attributes?.token_prices?.[SOL]);
+      if (v > 0) return v;
+    } catch {}
+    try {
+      const d = await dexScreener(SOL);
+      if (d?.priceUsd > 0) return d.priceUsd;
+    } catch {}
+    return null;
   });
 }
 
@@ -266,7 +327,7 @@ async function pumpInfo(ca) {
             ? round((1 - webReal / PUMP_INITIAL_REAL_TOKENS) * 100, 1)
             : null,
       marketCapSol: chain?.marketCapSol ?? web?.market_cap ?? null,
-      marketCapUsd: web?.usd_market_cap ?? null,
+      marketCapUsd: web?.usd_market_cap ?? (chain?.marketCapSol != null ? await solPriceUsd().then((p) => (p ? round(chain.marketCapSol * p, 0) : null)).catch(() => null) : null),
       solInCurve: chain?.solInCurve ?? null,
       bondingCurve: chain?.bondingCurve ?? web?.bonding_curve ?? null,
       replies: web?.reply_count ?? null,
