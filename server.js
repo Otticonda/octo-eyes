@@ -17,7 +17,7 @@ const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const SECRET = (process.env.OCTO_SECRET || "").trim();
 const MCP_PATH = SECRET ? `/mcp/${SECRET}` : "/mcp";
 const STREAM_URL = "wss://pumpportal.fun/api/data";
-const VERSION = "3.11.0";
+const VERSION = "3.12.0";
 const PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
 const CA_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -356,7 +356,7 @@ async function candles(ca, timeframe = "5m", limit = 120) {
       timeframe: "1s",
       following: true,
       candles: list,
-      note: list.length ? undefined : wasFollowing ? "No trades on this coin in the last 15 minutes." : "Started following this coin; 1s candles appear as trades come in.",
+      note: list.length ? undefined : wasFollowing ? "No trades on this coin in the last 3 hours." : "Started following this coin; 1s candles appear as trades come in.",
       feed: { liveFeed: curveWsState, rpc: RPC_KIND, updates: curveTicks, following: tradeSubs.size, subscribed: subToKey.size, thisCoin: following.get(ca)?.kind ?? null, droppedNoSolPrice: droppedNoPrice, solUsd: solUsdNow, notes: streamNotes.slice(0, 3) },
     };
   }
@@ -370,6 +370,10 @@ async function candles(ca, timeframe = "5m", limit = 120) {
       return { found: list.length > 0, source: "Kraken SOL/USD", timeframe: tf, candles: list };
     });
   }
+  // Coins Octo follows live: build this timeframe from its own ticks (up to 3 hours back).
+  followTrades(ca);
+  const live = tickCandles(ca, n, TF_MS[tf] || 60e3);
+  if (live.length >= 10) return { found: true, source: "live trades", timeframe: tf, candles: live };
   return cached(`ohlcv:${ca}:${tf}:${n}`, 20_000, async () => {
     const solUsd = await solPriceUsd().catch(() => null);
     const own = ownCandles(ca, tf, n, solUsd);
@@ -390,10 +394,11 @@ async function candles(ca, timeframe = "5m", limit = 120) {
       geckoError = e.message;
     }
     const useOwn = own.length > gecko.length;
-    const list = useOwn ? own : gecko;
+    let list = useOwn ? own : gecko;
+    if (live.length > list.length) list = live;
     return {
       found: list.length > 0,
-      source: list.length ? (useOwn ? "Octo's own curve readings" : "GeckoTerminal") : null,
+      source: list.length ? (list === live ? "live trades" : useOwn ? "Octo's own curve readings" : "GeckoTerminal") : null,
       pool,
       timeframe: tf,
       candles: list,
@@ -829,8 +834,8 @@ function recordTick(mint, priceSol, volSol) {
   let b = tradeBuf.get(mint);
   if (!b) tradeBuf.set(mint, (b = []));
   b.push({ t: Date.now(), p: priceSol * solUsdNow, s: priceSol, v: (volSol || 0) * solUsdNow });
-  const cut = Date.now() - 15 * 60_000;
-  while (b.length && (b[0].t < cut || b.length > 6000)) b.shift();
+  const cut = Date.now() - 3 * 3.6e6; // keep 3 hours of ticks per followed coin
+  while (b.length && (b[0].t < cut || b.length > 30000)) b.shift();
 }
 function note(message) {
   streamNotes.unshift({ at: new Date().toISOString(), message: String(message).slice(0, 200) });
@@ -1048,14 +1053,18 @@ function wsUnsubscribe(key) {
 
 // 1-second candles; seconds with no trade carry the last close so time stays even.
 function secondCandles(mint, n) {
+  return tickCandles(mint, n, 1000);
+}
+// Candles of any size built from the live ticks; empty buckets carry the last close.
+function tickCandles(mint, n, ms) {
   const b = tradeBuf.get(mint);
   if (!b || !b.length) return [];
-  const end = Math.floor(Date.now() / 1000) * 1000;
-  const start = Math.max(Math.floor(b[0].t / 1000) * 1000, end - (n - 1) * 1000);
+  const end = Math.floor(Date.now() / ms) * ms;
+  const start = Math.max(Math.floor(b[0].t / ms) * ms, end - (n - 1) * ms);
   const by = new Map();
   let before = null;
   for (const x of b) {
-    const k = Math.floor(x.t / 1000) * 1000;
+    const k = Math.floor(x.t / ms) * ms;
     if (k < start) { before = x.p; continue; }
     const c = by.get(k);
     if (!c) by.set(k, { t: k, o: x.p, h: x.p, l: x.p, c: x.p, v: x.v });
@@ -1063,7 +1072,7 @@ function secondCandles(mint, n) {
   }
   const out = [];
   let last = before;
-  for (let k = start; k <= end; k += 1000) {
+  for (let k = start; k <= end; k += ms) {
     const c = by.get(k);
     if (c) { if (last != null) { c.o = last; c.h = Math.max(c.h, last); c.l = Math.min(c.l, last); } out.push(c); last = c.c; }
     else if (last != null) out.push({ t: k, o: last, h: last, l: last, c: last, v: 0 });
@@ -2238,7 +2247,7 @@ const TOOLS = [
   },
   {
     name: "candles",
-    description: "Price candles (open, high, low, close, volume in USD) for a Solana token, oldest first. Timeframes: 1s (built live from every trade on the coin's pump.fun curve, then its PumpSwap pool after migration; last 15 minutes), 1m, 5m, 15m, 1h, 4h, 1d (GeckoTerminal, or Octo's own curve readings for brand-new coins).",
+    description: "Price candles (open, high, low, close, volume in USD) for a Solana token, oldest first. Timeframes: 1s (built live from every trade on the coin's pump.fun curve, then its PumpSwap pool after migration; up to 3 hours back), 1m, 5m, 15m, 1h, 4h, 1d (GeckoTerminal, or Octo's own curve readings for brand-new coins).",
     inputSchema: {
       type: "object",
       properties: {
