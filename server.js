@@ -17,7 +17,7 @@ const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const SECRET = (process.env.OCTO_SECRET || "").trim();
 const MCP_PATH = SECRET ? `/mcp/${SECRET}` : "/mcp";
 const STREAM_URL = "wss://pumpportal.fun/api/data";
-const VERSION = "3.10.1";
+const VERSION = "3.11.0";
 const PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
 const CA_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -1494,7 +1494,9 @@ async function buyInner(mint, sol, reason, score, source) {
         pos.symbol = r?.market?.symbol || r?.pumpfun?.symbol || null;
       })
       .catch(() => {});
-    logTrade({ side: "buy", mode: pos.mode, mint, sol: amt, tokens, signature: sig, reason: pos.reason });
+    pos.tokensBought = tokens;
+    pos.solUsdAtOpen = solUsdNow;
+    logTrade({ side: "buy", mode: pos.mode, mint, sol: amt, tokens, priceSol: quotePrice, priceUsd: solUsdNow ? quotePrice * solUsdNow : null, signature: sig, reason: pos.reason });
     return {
       ok: true,
       mode: pos.mode,
@@ -1515,6 +1517,8 @@ async function sell(mint, percent, why) {
     const pos = positions.get(mint);
     let sig;
     let received;
+    let fillPriceSol = null;
+    const qtySold = pos ? (pos.tokens * pct) / 100 : null;
     if (PAPER) {
       if (!pos || !(pos.tokens > 0)) {
         positions.delete(mint);
@@ -1528,6 +1532,7 @@ async function sell(mint, percent, why) {
         received = 0;
       } else {
         const qty = (pos.tokens * pct) / 100;
+        fillPriceSol = price;
         received = Math.max(0, round(qty * price * (1 - PAPER_COST) - LIMITS.priorityFeeSol, 6));
       }
       paper.cashSol = round(paper.cashSol + received, 6);
@@ -1542,9 +1547,11 @@ async function sell(mint, percent, why) {
       sig = await swap("sell", mint, `${pct}%`);
       const solAfter = await solBalance().catch(() => null);
       received = solAfter != null ? round(solAfter - solBefore, 4) : null;
+      if (received > 0 && qtySold > 0) fillPriceSol = received / qtySold;
     }
     if (pos) {
       pos.soldSol = round((pos.soldSol || 0) + (received || 0), 6);
+      pos.tokensSold = (pos.tokensSold || 0) + (qtySold || 0);
       if (pct >= 100) {
         positions.delete(mint);
         if (tradeSubs.get(mint) === Infinity) tradeSubs.set(mint, Date.now());
@@ -1563,6 +1570,10 @@ async function sell(mint, percent, why) {
           returnedSol: pos.soldSol,
           pnlSol,
           multiple: pos.costSol ? round(pos.soldSol / pos.costSol, 2) : null,
+          entryPriceSol: pos.entryPriceSol ?? null,
+          exitPriceSol: pos.tokensSold > 0 ? pos.soldSol / pos.tokensSold : null,
+          solUsdAtOpen: pos.solUsdAtOpen ?? null,
+          solUsdAtClose: solUsdNow,
           won: pos.soldSol > pos.costSol,
           exitReason: why || "manual",
           buyReason: pos.reason,
@@ -1574,7 +1585,7 @@ async function sell(mint, percent, why) {
         if (closedTrades.length > 200) closedTrades.pop();
       } else pos.tokens = Math.max(0, pos.tokens * (1 - pct / 100));
     }
-    logTrade({ side: "sell", mode: PAPER ? "paper" : "live", mint, percent: pct, solReceived: received, signature: sig, reason: why || "manual" });
+    logTrade({ side: "sell", mode: PAPER ? "paper" : "live", mint, percent: pct, solReceived: received, priceSol: fillPriceSol, priceUsd: fillPriceSol && solUsdNow ? fillPriceSol * solUsdNow : null, signature: sig, reason: why || "manual" });
     return {
       ok: true,
       mode: PAPER ? "paper" : "live",
@@ -1626,7 +1637,7 @@ async function walletStatus() {
     limits: LIMITS,
     rules: RULES,
     openPositions: views,
-    recentTrades: tradeLog.slice(0, 15),
+    recentTrades: tradeLog.slice(0, 40),
   };
 }
 
