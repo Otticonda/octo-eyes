@@ -49,7 +49,7 @@ Octo can trade with its own wallet. Use a brand-new wallet that holds only what 
 Rules the server always applies: it never buys a coin with mint or freeze authority on, never signs a transaction paid by any other wallet, and runs exits every 20 seconds.
 Trades go through PumpPortal's trade API, which charges a small fee per trade; check pumpportal.fun for the current rate.
 Positions live in memory. After a restart, Octo rebuilds them from the coins in its wallet, with entry prices reset to the current price.
-While Octo holds coins it pings itself every 10 minutes so the free plan doesn't sleep through an exit.
+While a trading wallet is set, the server pings itself every 10 minutes so the free plan doesn't sleep through an exit.
 
 ## Deploy on Render (free)
 
