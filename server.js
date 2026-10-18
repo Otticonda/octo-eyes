@@ -17,7 +17,7 @@ const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const SECRET = (process.env.OCTO_SECRET || "").trim();
 const MCP_PATH = SECRET ? `/mcp/${SECRET}` : "/mcp";
 const STREAM_URL = "wss://pumpportal.fun/api/data";
-const VERSION = "1.3.0";
+const VERSION = "1.4.0";
 const PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
 const CA_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -376,11 +376,22 @@ async function pumpInfo(ca) {
     const seen = launches.find((l) => l.mint === ca);
     let name = web?.name ?? seen?.name ?? null;
     let symbol = web?.symbol ?? seen?.symbol ?? null;
-    if (!name) {
+    // Lore and socials: from pump.fun when it answers, otherwise from the coin's own metadata file.
+    let meta = null;
+    if (!web) {
       try {
         const a = await rpc("getAsset", { id: ca });
-        name = a?.content?.metadata?.name || null;
-        symbol = a?.content?.metadata?.symbol || null;
+        name = name || a?.content?.metadata?.name || null;
+        symbol = symbol || a?.content?.metadata?.symbol || null;
+        meta = { description: a?.content?.metadata?.description || null };
+        const uri = a?.content?.json_uri;
+        if (uri) {
+          try {
+            const u = uri.startsWith("ipfs://") ? "https://ipfs.io/ipfs/" + uri.slice(7) : uri;
+            const m = await getJSON(u, {}, 5000, 0);
+            if (m && typeof m === "object") meta = { ...meta, ...m, description: m.description || meta.description };
+          } catch {}
+        }
       } catch {}
     }
     const webReal = Number(web?.real_token_reserves);
@@ -404,10 +415,10 @@ async function pumpInfo(ca) {
       solInCurve: chain?.solInCurve ?? null,
       bondingCurve: chain?.bondingCurve ?? web?.bonding_curve ?? null,
       replies: web?.reply_count ?? null,
-      twitter: web?.twitter || null,
-      telegram: web?.telegram || null,
-      website: web?.website || null,
-      description: web ? (web.description || "").slice(0, 300) : null,
+      twitter: web?.twitter || meta?.twitter || null,
+      telegram: web?.telegram || meta?.telegram || null,
+      website: web?.website || meta?.website || null,
+      lore: String((web ? web.description : meta?.description) || "").slice(0, 500) || null,
     };
   });
 }
