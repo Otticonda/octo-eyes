@@ -17,7 +17,7 @@ const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const SECRET = (process.env.OCTO_SECRET || "").trim();
 const MCP_PATH = SECRET ? `/mcp/${SECRET}` : "/mcp";
 const STREAM_URL = "wss://pumpportal.fun/api/data";
-const VERSION = "2.0.0";
+const VERSION = "3.0.0";
 const PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
 const CA_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -145,8 +145,13 @@ async function chainPump(ca) {
   const acc = await rpc("getAccountInfo", [bc, { encoding: "base64" }]);
   const v = acc?.value;
   if (!v || v.owner !== PUMP_PROGRAM) return { found: false, bondingCurve: bc, note: "No pump.fun bonding curve for this token, so it's probably not a pump.fun coin." };
-  const d = Buffer.from(v.data[0], "base64");
-  if (d.length < 49) return { found: false, bondingCurve: bc, note: "Unexpected bonding curve data." };
+  const parsed = parseCurve(Buffer.from(v.data[0], "base64"));
+  if (!parsed) return { found: false, bondingCurve: bc, note: "Unexpected bonding curve data." };
+  return { found: true, bondingCurve: bc, ...parsed };
+}
+
+function parseCurve(d) {
+  if (!d || d.length < 49) return null;
   const vTok = Number(d.readBigUInt64LE(8));
   const vSol = Number(d.readBigUInt64LE(16));
   const rTok = Number(d.readBigUInt64LE(24));
@@ -160,8 +165,6 @@ async function chainPump(ca) {
   }
   const priceSol = vTok > 0 ? vSol / 1e9 / (vTok / 1e6) : null;
   return {
-    found: true,
-    bondingCurve: bc,
     creator,
     migrated: complete,
     bondingCurveProgressPct: complete ? 100 : rTok > 0 ? round((1 - rTok / PUMP_INITIAL_REAL_TOKENS) * 100, 1) : null,
@@ -487,6 +490,137 @@ async function safetyCheck(ca, hints = {}) {
   });
 }
 
+// ---------------------------------------------------------------- rug radar
+async function pmap(items, fn, limit = 5) {
+  const out = new Array(items.length);
+  let i = 0;
+  const worker = async () => {
+    while (i < items.length) {
+      const k = i++;
+      out[k] = await fn(items[k]).catch(() => null);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return out;
+}
+
+// All signatures for an address, newest first, up to 3 pages. complete=false if there are more.
+async function allSigs(address) {
+  let all = [];
+  let before;
+  for (let page = 0; page < 3; page++) {
+    const r = await rpc("getSignaturesForAddress", [address, before ? { limit: 1000, before } : { limit: 1000 }]);
+    all = all.concat(r || []);
+    if (!r || r.length < 1000) return { sigs: all, complete: true };
+    before = r[r.length - 1].signature;
+  }
+  return { sigs: all, complete: false };
+}
+
+// Who bought in the coin's first blocks: bundles (same block as creation) and snipers (first 3 blocks).
+async function earlyBuyers(mint, bondingCurve, creator, supplyUi) {
+  const { sigs, complete } = await allSigs(bondingCurve);
+  if (!complete) return { checked: false, note: "Too many trades to look back to the very first buyers." };
+  const ok = sigs.filter((x) => !x.err).reverse();
+  if (!ok.length) return { checked: false, note: "No trades found." };
+  const createSlot = ok[0].slot;
+  const first = ok.slice(0, 25);
+  const txs = await pmap(first, (x) => rpc("getTransaction", [x.signature, { encoding: "jsonParsed", maxSupportedTransactionVersion: 0 }]));
+  const byWallet = new Map();
+  txs.forEach((tx, idx) => {
+    if (!tx?.meta) return;
+    const keys = tx.transaction?.message?.accountKeys || [];
+    const payer = typeof keys[0] === "string" ? keys[0] : keys[0]?.pubkey;
+    if (!payer) return;
+    const amt = (arr) => (arr || []).filter((b) => b.mint === mint && b.owner === payer).reduce((sum, b) => sum + (Number(b.uiTokenAmount?.uiAmount) || 0), 0);
+    const delta = amt(tx.meta.postTokenBalances) - amt(tx.meta.preTokenBalances);
+    if (delta <= 0) return;
+    const w = byWallet.get(payer) || { wallet: payer, tokens: 0, firstSlot: first[idx].slot };
+    w.tokens += delta;
+    w.firstSlot = Math.min(w.firstSlot, first[idx].slot);
+    byWallet.set(payer, w);
+  });
+  const supply = supplyUi || 1e9;
+  const pct = (t) => round((t / supply) * 100, 2);
+  const buyers = [...byWallet.values()].map((w) => ({ ...w, pct: pct(w.tokens), isDev: w.wallet === creator }));
+  const notDev = buyers.filter((b) => !b.isDev);
+  const bundled = notDev.filter((b) => b.firstSlot === createSlot);
+  const snipers = notDev.filter((b) => b.firstSlot <= createSlot + 2);
+  const sum = (arr) => round(arr.reduce((t, b) => t + (b.pct || 0), 0), 2);
+  return {
+    checked: true,
+    firstTradesChecked: first.length,
+    bundledWallets: bundled.length,
+    bundledPct: sum(bundled),
+    sniperWallets: snipers.length,
+    sniperPct: sum(snipers),
+    earlyWallets: buyers.sort((a, b) => b.tokens - a.tokens).slice(0, 8).map((b) => ({ wallet: b.wallet, pct: b.pct, blocksAfterLaunch: b.firstSlot - createSlot, isDev: b.isDev })),
+  };
+}
+
+async function devCheck(creator) {
+  const [sigs, bal] = await Promise.all([rpc("getSignaturesForAddress", [creator, { limit: 1000 }]), rpc("getBalance", [creator]).catch(() => null)]);
+  const n = sigs?.length || 0;
+  const oldest = n ? sigs[n - 1].blockTime : null;
+  const ageDays = oldest ? (Date.now() / 1000 - oldest) / 86400 : null;
+  const seen = launches.filter((l) => l.creator === creator);
+  return {
+    wallet: creator,
+    txCount: n >= 1000 ? "1000+" : n,
+    walletAgeDays: ageDays != null ? round(ageDays, 1) : null,
+    walletAgeIsMinimum: n >= 1000,
+    solBalance: bal?.value != null ? round(bal.value / 1e9, 3) : null,
+    otherLaunchesSeenRecently: seen.length,
+    recentLaunchNames: seen.slice(0, 5).map((l) => `${l.name} (${l.symbol})`),
+  };
+}
+
+// Top holders whose wallets are brand new: a classic sign of insiders splitting supply.
+async function freshHolders(topHolders) {
+  const real = (topHolders || []).filter((h) => h.owner && h.label !== "pump.fun bonding curve").slice(0, 10);
+  const checks = await pmap(real, (h) => rpc("getSignaturesForAddress", [h.owner, { limit: 20 }]).then((r) => ({ ...h, txs: r?.length ?? 0 })));
+  const fresh = checks.filter((h) => h && h.txs < 12);
+  return { checked: real.length, freshWallets: fresh.length, freshPct: round(fresh.reduce((t, h) => t + (h.pct || 0), 0), 2), list: fresh.map((h) => ({ wallet: h.owner, pct: h.pct, txs: h.txs })) };
+}
+
+async function rugRadar(ca, pump, safety) {
+  return cached("radar:" + ca, 60_000, async () => {
+    const out = { riskScore: 0, risk: "low", reasons: [] };
+    const add = (pts, why) => {
+      out.riskScore += pts;
+      out.reasons.push(why);
+    };
+    const [early, dev, fresh] = await Promise.all([
+      pump?.bondingCurve ? earlyBuyers(ca, pump.bondingCurve, pump.creator, safety?.supply).catch((e) => ({ checked: false, note: e.message })) : Promise.resolve({ checked: false, note: "Not a pump.fun coin, so first-block buyers weren't checked." }),
+      pump?.creator ? devCheck(pump.creator).catch((e) => ({ error: e.message })) : Promise.resolve(null),
+      safety?.topHolders ? freshHolders(safety.topHolders).catch((e) => ({ error: e.message })) : Promise.resolve(null),
+    ]);
+    out.earlyBuyers = early;
+    out.dev = dev;
+    out.freshHolders = fresh;
+
+    if (safety?.mintAuthority) add(40, "mint authority on");
+    if (safety?.freezeAuthority) add(40, "freeze authority on");
+    if (early?.checked) {
+      if (early.bundledPct > 25) add(30, `${early.bundledWallets} wallets bundled ${early.bundledPct}% in the launch block`);
+      else if (early.bundledPct > 10) add(20, `${early.bundledWallets} wallets bundled ${early.bundledPct}% in the launch block`);
+      if (early.sniperPct > 20) add(15, `snipers took ${early.sniperPct}% in the first 3 blocks`);
+    }
+    if (fresh?.freshPct > 15) add(20, `${fresh.freshWallets} brand-new wallets hold ${fresh.freshPct}% among the top holders`);
+    else if (fresh?.freshPct > 7) add(10, `fresh wallets hold ${fresh.freshPct}% among the top holders`);
+    if (safety?.devHoldingPct > 5) add(10, `dev holds ${safety.devHoldingPct}%`);
+    if (safety?.top10HoldersPct > 30) add(15, `top 10 hold ${safety.top10HoldersPct}%`);
+    if (dev && !dev.error) {
+      if (dev.otherLaunchesSeenRecently >= 3) add(15, `dev launched ${dev.otherLaunchesSeenRecently} coins recently (serial launcher)`);
+      if (dev.walletAgeDays != null && dev.walletAgeDays < 1 && !dev.walletAgeIsMinimum && Number(dev.txCount) < 30) add(10, "dev wallet is less than a day old");
+    }
+    out.riskScore = Math.min(100, out.riskScore);
+    out.risk = out.riskScore >= 50 ? "high" : out.riskScore >= 25 ? "medium" : "low";
+    if (!out.reasons.length) out.reasons.push("no red flags found in what was checked");
+    return out;
+  });
+}
+
 async function tokenReport(ca) {
   const [mkt, pump] = await Promise.allSettled([marketData(ca), pumpInfo(ca)]);
   const pumpVal = pump.status === "fulfilled" ? pump.value : null;
@@ -497,12 +631,19 @@ async function tokenReport(ca) {
   } catch (e) {
     safety = { error: e.message };
   }
+  let radar;
+  try {
+    radar = await rugRadar(ca, pumpVal?.found ? pumpVal : null, safety?.found ? safety : null);
+  } catch (e) {
+    radar = { error: e.message };
+  }
   return {
     ca,
     checkedAt: new Date().toISOString(),
     market: mkt.status === "fulfilled" ? mkt.value : { error: mkt.reason?.message },
     pumpfun: pumpVal || { error: pump.reason?.message },
     safety,
+    rugRadar: radar,
   };
 }
 
@@ -593,6 +734,7 @@ const LIMITS = {
 let tradingOn = /^(1|true|on|yes)$/i.test(process.env.TRADING_ENABLED || "");
 const positions = new Map(); // mint -> position
 const tradeLog = [];
+const closedTrades = []; // the journal Octo learns from
 let spentDay = new Date().toISOString().slice(0, 10);
 let spentToday = 0;
 let tradeLock = Promise.resolve();
@@ -730,7 +872,31 @@ function needWallet() {
   if (!wallet) throw new Error(walletError || "No trading wallet set. Add OCTO_WALLET_KEY in Render's Environment settings.");
 }
 
-async function buy(mint, sol, reason) {
+function compactSignals(r) {
+  if (!r) return null;
+  const m = r.market || {};
+  const h1 = m.stats1h || {};
+  return {
+    marketCapUsd: m.marketCapUsd ?? r.pumpfun?.marketCapUsd ?? null,
+    liquidityUsd: m.liquidityUsd ?? null,
+    holders: m.holders ?? null,
+    organicScore: m.organicScore != null ? round(m.organicScore, 0) : null,
+    buySellRatio1h: h1.buyVolumeUsd && h1.sellVolumeUsd ? round(h1.buyVolumeUsd / h1.sellVolumeUsd, 2) : null,
+    netBuyers1h: h1.netBuyers ?? null,
+    priceChange1h: h1.priceChangePct ?? null,
+    bondingCurveProgressPct: r.pumpfun?.bondingCurveProgressPct ?? null,
+    migrated: r.pumpfun?.migrated ?? null,
+    top10HoldersPct: r.safety?.top10HoldersPct ?? null,
+    devHoldingPct: r.safety?.devHoldingPct ?? null,
+    riskScore: r.rugRadar?.riskScore ?? null,
+    risk: r.rugRadar?.risk ?? null,
+    bundledPct: r.rugRadar?.earlyBuyers?.bundledPct ?? null,
+    sniperPct: r.rugRadar?.earlyBuyers?.sniperPct ?? null,
+    freshHolderPct: r.rugRadar?.freshHolders?.freshPct ?? null,
+  };
+}
+
+async function buy(mint, sol, reason, score) {
   needWallet();
   if (!tradingOn) throw new Error("Trading is paused. Turn it on with set_trading, or set TRADING_ENABLED=true on Render.");
   return withLock(async () => {
@@ -758,14 +924,27 @@ async function buy(mint, sol, reason) {
     spentToday += amt;
     const pos = {
       mint,
+      name: null,
+      symbol: null,
       tokens,
       costSol: amt,
+      soldSol: 0,
       entryPriceSol: tokens > 0 ? amt / tokens : null,
       soldHalf: false,
       openedAt: new Date().toISOString(),
       reason: String(reason || "").slice(0, 200),
+      sendScore: Number.isFinite(Number(score)) ? Number(score) : null,
+      entrySignals: null,
     };
     positions.set(mint, pos);
+    // Snapshot what the coin looked like at entry, for the journal (runs in the background).
+    tokenReport(mint)
+      .then((r) => {
+        pos.entrySignals = compactSignals(r);
+        pos.name = r?.market?.name || r?.pumpfun?.name || null;
+        pos.symbol = r?.market?.symbol || r?.pumpfun?.symbol || null;
+      })
+      .catch(() => {});
     logTrade({ side: "buy", mint, sol: amt, tokens, signature: sig, reason: pos.reason });
     return { ok: true, signature: sig, solscan: `https://solscan.io/tx/${sig}`, position: pos, spentToday: round(spentToday, 3) };
   });
@@ -786,8 +965,28 @@ async function sell(mint, percent, why) {
     const received = solAfter != null ? round(solAfter - solBefore, 4) : null;
     const pos = positions.get(mint);
     if (pos) {
-      if (pct >= 100) positions.delete(mint);
-      else pos.tokens = Math.max(0, pos.tokens * (1 - pct / 100));
+      pos.soldSol = round((pos.soldSol || 0) + (received || 0), 4);
+      if (pct >= 100) {
+        positions.delete(mint);
+        closedTrades.unshift({
+          mint,
+          name: pos.name,
+          symbol: pos.symbol,
+          openedAt: pos.openedAt,
+          closedAt: new Date().toISOString(),
+          holdHours: round((Date.now() - Date.parse(pos.openedAt)) / 3.6e6, 2),
+          costSol: pos.costSol,
+          returnedSol: pos.soldSol,
+          pnlSol: round(pos.soldSol - pos.costSol, 4),
+          multiple: pos.costSol ? round(pos.soldSol / pos.costSol, 2) : null,
+          won: pos.soldSol > pos.costSol,
+          exitReason: why || "manual",
+          buyReason: pos.reason,
+          sendScore: pos.sendScore,
+          entrySignals: pos.entrySignals,
+        });
+        if (closedTrades.length > 200) closedTrades.pop();
+      } else pos.tokens = Math.max(0, pos.tokens * (1 - pct / 100));
     }
     logTrade({ side: "sell", mint, percent: pct, solReceived: received, signature: sig, reason: why || "manual" });
     return { ok: true, signature: sig, solscan: `https://solscan.io/tx/${sig}`, percentSold: pct, solReceived: received };
@@ -857,6 +1056,87 @@ async function recoverPositions() {
   } catch (e) {
     logTrade({ side: "error", error: "recover: " + e.message });
   }
+}
+
+// ---------------------------------------------------------------- coin scanner
+// Every 45s, reads the bonding curve of each coin launched in the last 40 minutes and tracks its momentum.
+const scan = new Map();
+async function scanTick() {
+  const now = Date.now();
+  const live = launches.filter((l) => {
+    const age = now - Date.parse(l.at);
+    return age > 45_000 && age < 40 * 60_000;
+  }).slice(0, 100);
+  if (!live.length) return;
+  const keys = live.map((l) => l.bondingCurve || findPDA([Buffer.from("bonding-curve"), pubkeyBytes(l.mint)], PUMP_PROGRAM));
+  const r = await rpc("getMultipleAccounts", [keys, { encoding: "base64" }]);
+  (r?.value || []).forEach((acc, i) => {
+    if (!acc?.data) return;
+    const p = parseCurve(Buffer.from(acc.data[0], "base64"));
+    if (!p) return;
+    const l = live[i];
+    const prev = scan.get(l.mint);
+    scan.set(l.mint, {
+      mint: l.mint,
+      name: l.name,
+      symbol: l.symbol,
+      creator: l.creator,
+      devInitialBuySol: l.devInitialBuySol,
+      launchedAt: l.at,
+      firstAt: prev?.firstAt ?? now,
+      firstProgress: prev?.firstProgress ?? (p.bondingCurveProgressPct || 0),
+      lastAt: now,
+      ...p,
+    });
+  });
+  for (const [m, e] of scan) if (now - Date.parse(e.launchedAt) > 60 * 60_000) scan.delete(m);
+}
+
+async function scannerPicks(limit = 5) {
+  const now = Date.now();
+  const sol = await solPriceUsd().catch(() => null);
+  const rows = [...scan.values()].map((e) => {
+    const ageMin = Math.max(0.5, (now - Date.parse(e.launchedAt)) / 60000);
+    const watchedMin = Math.max(0.5, (e.lastAt - e.firstAt) / 60000);
+    const progress = e.migrated ? 100 : e.bondingCurveProgressPct || 0;
+    const speed = progress / ageMin; // % of the curve filled per minute since launch
+    const recent = e.lastAt > e.firstAt ? (progress - e.firstProgress) / watchedMin : 0; // since Octo started watching
+    const score = progress * 0.5 + Math.min(speed, 15) * 3 + Math.max(-10, Math.min(recent, 10)) * 2 - (e.devInitialBuySol > 3 ? 10 : 0);
+    return {
+      mint: e.mint,
+      name: e.name,
+      symbol: e.symbol,
+      ageMinutes: round(ageMin, 1),
+      bondingCurveProgressPct: round(progress, 1),
+      migrated: e.migrated,
+      fillSpeedPctPerMin: round(speed, 2),
+      recentMomentumPctPerMin: round(recent, 2),
+      marketCapSol: e.marketCapSol,
+      marketCapUsd: sol && e.marketCapSol ? round(e.marketCapSol * sol, 0) : null,
+      devInitialBuySol: e.devInitialBuySol,
+      creator: e.creator,
+      momentumScore: round(score, 1),
+    };
+  });
+  return {
+    stream: streamState,
+    coinsTracked: scan.size,
+    note: "Momentum only. Run token_report on a pick before buying: it adds the rug radar and holder checks.",
+    picks: rows.filter((r) => r.bondingCurveProgressPct >= 8).sort((a, b) => b.momentumScore - a.momentumScore).slice(0, Math.max(1, Math.min(20, limit))),
+  };
+}
+
+function journalStats() {
+  const t = closedTrades;
+  if (!t.length) return { trades: 0 };
+  const wins = t.filter((x) => x.won).length;
+  return {
+    trades: t.length,
+    wins,
+    winRatePct: round((wins / t.length) * 100, 1),
+    totalPnlSol: round(t.reduce((s2, x) => s2 + (x.pnlSol || 0), 0), 4),
+    avgMultiple: round(t.reduce((s2, x) => s2 + (x.multiple || 0), 0) / t.length, 2),
+  };
 }
 
 // ---------------------------------------------------------------- tools
@@ -952,10 +1232,11 @@ const TOOLS = [
         ca: { type: "string", description: "Token mint address." },
         sol: { type: "number", description: "SOL to spend; anything above the per-buy limit is cut down to it." },
         reason: { type: "string", description: "Why Octo is buying, in a few words." },
+        score: { type: "number", description: "Octo's send score for this coin, 0-10, saved to the trade journal." },
       },
       required: ["ca"],
     },
-    run: async ({ ca, sol, reason }) => buy(needCA(ca), sol, reason),
+    run: async ({ ca, sol, reason, score }) => buy(needCA(ca), sol, reason, score),
   },
   {
     name: "sell",
@@ -966,6 +1247,18 @@ const TOOLS = [
       required: ["ca"],
     },
     run: async ({ ca, percent }) => sell(needCA(ca), percent ?? 100, "manual"),
+  },
+  {
+    name: "scanner",
+    description: "Octo's coin scanner: the pump.fun coins launched in the last 40 minutes with the strongest bonding-curve momentum (how fast the curve is filling, progress, market cap, dev's first buy). Momentum only: run token_report on a pick before buying.",
+    inputSchema: { type: "object", properties: { limit: { type: "integer", minimum: 1, maximum: 20, description: "How many picks (default 5)." } } },
+    run: async ({ limit = 5 } = {}) => scannerPicks(Number(limit) || 5),
+  },
+  {
+    name: "trade_journal",
+    description: "Octo's trade journal: every closed trade with cost, return, multiple, exit reason, send score and the coin's signals at entry, plus win rate and total P&L. Use it to learn which signals actually led to wins.",
+    inputSchema: { type: "object", properties: { limit: { type: "integer", minimum: 1, maximum: 200, description: "How many closed trades (default 50)." } } },
+    run: async ({ limit = 50 } = {}) => ({ stats: journalStats(), closedTrades: closedTrades.slice(0, Math.max(1, Math.min(200, Number(limit) || 50))), openPositions: [...positions.values()] }),
   },
   {
     name: "set_trading",
@@ -1042,7 +1335,7 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://localhost");
 
   if (url.pathname === "/" || url.pathname === "/health") {
-    return send(res, 200, { name: "Octo Eyes", version: VERSION, ok: true, rpc: RPC_KIND, stream: streamState, launchesSeen: launches.length, watching: watched.size, wallet: wallet ? wallet.publicKey : walletError ? "error: " + walletError : "not set", trading: wallet ? (tradingOn ? "on" : "paused") : "off", openPositions: positions.size });
+    return send(res, 200, { name: "Octo Eyes", version: VERSION, ok: true, rpc: RPC_KIND, stream: streamState, launchesSeen: launches.length, watching: watched.size, wallet: wallet ? wallet.publicKey : walletError ? "error: " + walletError : "not set", trading: wallet ? (tradingOn ? "on" : "paused") : "off", openPositions: positions.size, scannerTracking: scan.size, journalTrades: closedTrades.length });
   }
   if (url.pathname !== MCP_PATH) return send(res, 404, { error: "Not found" });
   if (req.method === "GET" || req.method === "DELETE") return send(res, 405, { error: "Method not allowed" }, { allow: "POST" });
@@ -1065,8 +1358,10 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   console.log(`Octo Eyes listening on :${PORT}, MCP endpoint ${SECRET ? "/mcp/<secret>" : "/mcp"}`);
-  if (process.env.OCTO_NO_STREAM !== "1") connectStream();
-  else streamState = "off";
+  if (process.env.OCTO_NO_STREAM !== "1") {
+    connectStream();
+    setInterval(() => scanTick().catch(() => {}), 45_000);
+  } else streamState = "off";
   if (wallet) {
     console.log(`Trading wallet ${wallet.publicKey}, trading ${tradingOn ? "on" : "paused"}`);
     recoverPositions();
