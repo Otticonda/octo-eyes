@@ -17,7 +17,7 @@ const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const SECRET = (process.env.OCTO_SECRET || "").trim();
 const MCP_PATH = SECRET ? `/mcp/${SECRET}` : "/mcp";
 const STREAM_URL = "wss://pumpportal.fun/api/data";
-const VERSION = "3.6.0";
+const VERSION = "3.7.0";
 const PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
 const CA_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -352,12 +352,12 @@ async function candles(ca, timeframe = "5m", limit = 120) {
     const list = secondCandles(ca, n);
     return {
       found: list.length > 0,
-      source: list.length ? "live bonding-curve updates" : null,
+      source: list.length ? (following.get(ca)?.kind === "pool" ? "live PumpSwap pool updates" : "live bonding-curve updates") : null,
       timeframe: "1s",
       following: true,
       candles: list,
-      note: list.length ? undefined : wasFollowing ? "No trades on this coin in the last 15 minutes." : "Started following this coin's curve; 1s candles appear as trades come in. Migrated coins have no curve to follow.",
-      feed: { curveFeed: curveWsState, rpc: RPC_KIND, curveUpdates: curveTicks, following: tradeSubs.size, subscribed: subToMint.size, droppedNoSolPrice: droppedNoPrice, solUsd: solUsdNow, notes: streamNotes.slice(0, 3) },
+      note: list.length ? undefined : wasFollowing ? "No trades on this coin in the last 15 minutes." : "Started following this coin; 1s candles appear as trades come in.",
+      feed: { liveFeed: curveWsState, rpc: RPC_KIND, updates: curveTicks, following: tradeSubs.size, subscribed: subToKey.size, thisCoin: following.get(ca)?.kind ?? null, droppedNoSolPrice: droppedNoPrice, solUsd: solUsdNow, notes: streamNotes.slice(0, 3) },
     };
   }
   if (ca === "So11111111111111111111111111111111111111112") {
@@ -785,6 +785,8 @@ let solUsdNow = null;
 setInterval(() => solPriceUsd().then((v) => v && (solUsdNow = v)).catch(() => {}), 60_000);
 solPriceUsd().then((v) => v && (solUsdNow = v)).catch(() => {});
 
+// Follow a coin live: its pump.fun bonding curve while it's on the curve, then its PumpSwap pool
+// after it migrates. Every trade changes these accounts, and the RPC's websocket pushes each change.
 function followTrades(mint, keep = false) {
   if (!mint) return;
   const was = tradeSubs.has(mint);
@@ -795,12 +797,12 @@ function followTrades(mint, keep = false) {
     if (oldest) {
       tradeSubs.delete(oldest[0]);
       tradeBuf.delete(oldest[0]);
-      unsubscribeCurve(oldest[0]);
+      unfollowMint(oldest[0]);
     }
   }
-  subscribeCurve(mint);
+  startFollow(mint).catch((e) => note("follow " + mint.slice(0, 6) + ": " + e.message));
 }
-// One price point per curve change (every trade moves the curve). volSol = SOL that moved.
+// One price point per change. volSol = SOL that moved.
 function recordTick(mint, priceSol, volSol) {
   if (!(priceSol > 0) || !solUsdNow) {
     droppedNoPrice++;
@@ -812,17 +814,120 @@ function recordTick(mint, priceSol, volSol) {
   const cut = Date.now() - 15 * 60_000;
   while (b.length && (b[0].t < cut || b.length > 6000)) b.shift();
 }
+function note(message) {
+  streamNotes.unshift({ at: new Date().toISOString(), message: String(message).slice(0, 200) });
+  if (streamNotes.length > 8) streamNotes.pop();
+}
 
-// ---- live curve feed: the RPC's websocket pushes every change to a coin's bonding curve.
-// Free (no PumpPortal key needed). Works while a coin is still on its pump.fun curve.
+const WSOL = "So11111111111111111111111111111111111111112";
+const following = new Map(); // mint -> { kind: "curve" | "pool", lastRealSol, base, quote, lastQuote, pool }
+
+async function startFollow(mint) {
+  let onCurve = true;
+  try {
+    const c = await chainPump(mint);
+    onCurve = c.found && !c.migrated;
+  } catch {}
+  if (!tradeSubs.has(mint)) return;
+  if (onCurve) followCurve(mint);
+  else await followPool(mint);
+}
+
+function followCurve(mint) {
+  let curve;
+  try {
+    curve = findPDA([Buffer.from("bonding-curve"), pubkeyBytes(mint)], PUMP_PROGRAM);
+  } catch {
+    return;
+  }
+  const st = { kind: "curve", lastRealSol: null };
+  following.set(mint, st);
+  wsSubscribe(`${mint}:curve`, curve, "base64", (value) => {
+    const d = Buffer.from(value.data[0], "base64");
+    if (d.length < 49) return;
+    const vTok = Number(d.readBigUInt64LE(8));
+    const vSol = Number(d.readBigUInt64LE(16));
+    const rSol = Number(d.readBigUInt64LE(32));
+    const complete = d[48] === 1;
+    if (complete) {
+      // Migrated: the curve is closed, trading moves to a PumpSwap pool. Follow that instead.
+      wsUnsubscribe(`${mint}:curve`);
+      note(`${mint.slice(0, 6)} migrated, following its pool`);
+      setTimeout(() => followPoolWithRetry(mint, 6), 4000);
+      return;
+    }
+    if (!(vTok > 0)) return;
+    const moved = st.lastRealSol != null ? Math.abs(rSol - st.lastRealSol) / 1e9 : 0;
+    st.lastRealSol = rSol;
+    curveTicks++;
+    recordTick(mint, vSol / 1e9 / (vTok / 1e6), moved);
+  });
+}
+
+async function followPoolWithRetry(mint, tries) {
+  if (!tradeSubs.has(mint)) return;
+  try {
+    if (await followPool(mint)) return;
+  } catch (e) {
+    note(`pool for ${mint.slice(0, 6)}: ${e.message}`);
+  }
+  if (tries > 1) setTimeout(() => followPoolWithRetry(mint, tries - 1), 15_000);
+}
+
+// Find the coin's PumpSwap pool, then watch its two vaults (the token and the SOL it holds).
+async function followPool(mint) {
+  const d = await getJSON(`https://api.dexscreener.com/latest/dex/tokens/${mint}`, {}, 8000, 0);
+  const pairs = (d.pairs || []).filter((p) => p.chainId === "solana" && p.quoteToken?.address === WSOL && p.baseToken?.address === mint);
+  pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
+  const pool = (pairs.find((p) => /pump/i.test(p.dexId || "")) || pairs[0])?.pairAddress;
+  if (!pool) return false;
+  const [bv, qv] = await Promise.all([
+    rpc("getTokenAccountsByOwner", [pool, { mint }, { encoding: "jsonParsed" }]),
+    rpc("getTokenAccountsByOwner", [pool, { mint: WSOL }, { encoding: "jsonParsed" }]),
+  ]);
+  const baseVault = bv?.value?.[0]?.pubkey;
+  const quoteVault = qv?.value?.[0]?.pubkey;
+  if (!baseVault || !quoteVault || !tradeSubs.has(mint)) return false;
+  const amt = (a) => Number(a?.account?.data?.parsed?.info?.tokenAmount?.uiAmount);
+  const st = { kind: "pool", pool, base: amt(bv.value[0]), quote: amt(qv.value[0]), lastQuote: null };
+  following.set(mint, st);
+  const tick = () => {
+    if (!(st.base > 0) || !(st.quote > 0)) return;
+    const moved = st.lastQuote != null ? Math.abs(st.quote - st.lastQuote) : 0;
+    st.lastQuote = st.quote;
+    curveTicks++;
+    recordTick(mint, st.quote / st.base, moved);
+  };
+  const parsed = (value) => Number(value?.data?.parsed?.info?.tokenAmount?.uiAmount);
+  wsSubscribe(`${mint}:base`, baseVault, "jsonParsed", (value) => {
+    const v = parsed(value);
+    if (v > 0) st.base = v;
+  });
+  wsSubscribe(`${mint}:quote`, quoteVault, "jsonParsed", (value) => {
+    const v = parsed(value);
+    if (v > 0) {
+      st.quote = v;
+      tick();
+    }
+  });
+  tick();
+  return true;
+}
+
+function unfollowMint(mint) {
+  following.delete(mint);
+  for (const k of ["curve", "base", "quote"]) wsUnsubscribe(`${mint}:${k}`);
+}
+
+// ---- the RPC websocket: account subscriptions, resent after every reconnect
 const RPC_WS = RPC_URL.replace(/^http/i, "ws");
 let curveWs = null;
 let curveWsState = "off";
 let curveTicks = 0;
 let rpcMsgId = 1;
-const curveSubs = new Map(); // mint -> { curve, subId, lastRealSol }
-const subToMint = new Map();
-const pendingSubs = new Map(); // request id -> mint
+const wsSubs = new Map(); // key -> { account, encoding, handler, subId }
+const subToKey = new Map();
+const pendingSubs = new Map(); // request id -> key
 const curveOpen = () => curveWs && curveWs.readyState === 1;
 
 function connectCurveWs() {
@@ -840,10 +945,12 @@ function connectCurveWs() {
   curveWsState = "connecting";
   curveWs.addEventListener("open", () => {
     curveWsState = "live";
-    subToMint.clear();
+    subToKey.clear();
     pendingSubs.clear();
-    for (const c of curveSubs.values()) c.subId = null;
-    for (const mint of tradeSubs.keys()) subscribeCurve(mint, true);
+    for (const [key, s] of wsSubs) {
+      s.subId = null;
+      sendSubscribe(key, s);
+    }
   });
   curveWs.addEventListener("message", (ev) => {
     let m;
@@ -853,35 +960,25 @@ function connectCurveWs() {
       return;
     }
     if (m.id != null && pendingSubs.has(m.id)) {
-      const mint = pendingSubs.get(m.id);
+      const key = pendingSubs.get(m.id);
       pendingSubs.delete(m.id);
-      if (m.error) {
-        streamNotes.unshift({ at: new Date().toISOString(), message: "RPC: " + String(m.error.message || JSON.stringify(m.error)).slice(0, 180) });
-        if (streamNotes.length > 8) streamNotes.pop();
-        return;
-      }
-      const c = curveSubs.get(mint);
-      if (c && tradeSubs.has(mint)) {
-        c.subId = m.result;
-        subToMint.set(m.result, mint);
+      if (m.error) return note("RPC: " + (m.error.message || JSON.stringify(m.error)));
+      const s = wsSubs.get(key);
+      if (s) {
+        s.subId = m.result;
+        subToKey.set(m.result, key);
       } else if (curveOpen()) curveWs.send(JSON.stringify({ jsonrpc: "2.0", id: rpcMsgId++, method: "accountUnsubscribe", params: [m.result] }));
       return;
     }
     if (m.method === "accountNotification") {
-      const mint = subToMint.get(m.params?.subscription);
+      const key = subToKey.get(m.params?.subscription);
+      const s = key && wsSubs.get(key);
       const v = m.params?.result?.value;
-      if (!mint || !v?.data?.[0]) return;
-      const d = Buffer.from(v.data[0], "base64");
-      if (d.length < 49) return;
-      const vTok = Number(d.readBigUInt64LE(8));
-      const vSol = Number(d.readBigUInt64LE(16));
-      const rSol = Number(d.readBigUInt64LE(32));
-      if (!(vTok > 0)) return;
-      const c = curveSubs.get(mint);
-      const moved = c?.lastRealSol != null ? Math.abs(rSol - c.lastRealSol) / 1e9 : 0;
-      if (c) c.lastRealSol = rSol;
-      curveTicks++;
-      recordTick(mint, vSol / 1e9 / (vTok / 1e6), moved);
+      if (s && v) {
+        try {
+          s.handler(v);
+        } catch {}
+      }
     }
   });
   curveWs.addEventListener("close", () => {
@@ -892,28 +989,25 @@ function connectCurveWs() {
     curveWsState = "reconnecting";
   });
 }
-function subscribeCurve(mint, resend = false) {
-  let c = curveSubs.get(mint);
-  if (!c) {
-    try {
-      c = { curve: findPDA([Buffer.from("bonding-curve"), pubkeyBytes(mint)], PUMP_PROGRAM), subId: null, lastRealSol: null };
-    } catch {
-      return;
-    }
-    curveSubs.set(mint, c);
-  } else if (!resend && c.subId != null) return;
-  if (!curveOpen()) return; // subscribed when the socket opens
+function sendSubscribe(key, s) {
+  if (!curveOpen()) return; // sent when the socket opens
   const id = rpcMsgId++;
-  pendingSubs.set(id, mint);
-  curveWs.send(JSON.stringify({ jsonrpc: "2.0", id, method: "accountSubscribe", params: [c.curve, { encoding: "base64", commitment: "confirmed" }] }));
+  pendingSubs.set(id, key);
+  curveWs.send(JSON.stringify({ jsonrpc: "2.0", id, method: "accountSubscribe", params: [s.account, { encoding: s.encoding, commitment: "confirmed" }] }));
 }
-function unsubscribeCurve(mint) {
-  const c = curveSubs.get(mint);
-  if (!c) return;
-  curveSubs.delete(mint);
-  if (c.subId != null) {
-    subToMint.delete(c.subId);
-    if (curveOpen()) curveWs.send(JSON.stringify({ jsonrpc: "2.0", id: rpcMsgId++, method: "accountUnsubscribe", params: [c.subId] }));
+function wsSubscribe(key, account, encoding, handler) {
+  wsUnsubscribe(key);
+  const s = { account, encoding, handler, subId: null };
+  wsSubs.set(key, s);
+  sendSubscribe(key, s);
+}
+function wsUnsubscribe(key) {
+  const s = wsSubs.get(key);
+  if (!s) return;
+  wsSubs.delete(key);
+  if (s.subId != null) {
+    subToKey.delete(s.subId);
+    if (curveOpen()) curveWs.send(JSON.stringify({ jsonrpc: "2.0", id: rpcMsgId++, method: "accountUnsubscribe", params: [s.subId] }));
   }
 }
 
@@ -1933,7 +2027,7 @@ const TOOLS = [
   },
   {
     name: "candles",
-    description: "Price candles (open, high, low, close, volume in USD) for a Solana token, oldest first. Timeframes: 1s (built live from every change to the coin's pump.fun bonding curve, last 15 minutes, while it is still on the curve), 1m, 5m, 15m, 1h, 4h, 1d (GeckoTerminal, or Octo's own curve readings for brand-new coins).",
+    description: "Price candles (open, high, low, close, volume in USD) for a Solana token, oldest first. Timeframes: 1s (built live from every trade on the coin's pump.fun curve, then its PumpSwap pool after migration; last 15 minutes), 1m, 5m, 15m, 1h, 4h, 1d (GeckoTerminal, or Octo's own curve readings for brand-new coins).",
     inputSchema: {
       type: "object",
       properties: {
@@ -2035,7 +2129,7 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://localhost");
 
   if (url.pathname === "/" || url.pathname === "/health") {
-    return send(res, 200, { name: "Octo Eyes", version: VERSION, ok: true, rpc: RPC_KIND, stream: streamState, curveFeed: curveWsState, curveUpdates: curveTicks, followingCurves: subToMint.size, feedNotes: streamNotes.slice(0, 3), launchesSeen: launches.length, watching: watched.size, mode: PAPER ? "paper" : "live", wallet: PAPER ? "paper" : wallet ? wallet.publicKey : walletError ? "error: " + walletError : "not set", trading: PAPER || wallet ? (tradingOn ? "on" : "paused") : "off", autoPaper: AUTO_PAPER ? "on" : "off", memeDial: dialCache?.memeDial ?? null, openPositions: positions.size, scannerTracking: scan.size, journalTrades: closedTrades.length });
+    return send(res, 200, { name: "Octo Eyes", version: VERSION, ok: true, rpc: RPC_KIND, stream: streamState, liveFeed: curveWsState, liveUpdates: curveTicks, liveSubscriptions: subToKey.size, feedNotes: streamNotes.slice(0, 3), launchesSeen: launches.length, watching: watched.size, mode: PAPER ? "paper" : "live", wallet: PAPER ? "paper" : wallet ? wallet.publicKey : walletError ? "error: " + walletError : "not set", trading: PAPER || wallet ? (tradingOn ? "on" : "paused") : "off", autoPaper: AUTO_PAPER ? "on" : "off", memeDial: dialCache?.memeDial ?? null, openPositions: positions.size, scannerTracking: scan.size, journalTrades: closedTrades.length });
   }
   if (url.pathname !== MCP_PATH) return send(res, 404, { error: "Not found" });
   if (req.method === "GET" || req.method === "DELETE") return send(res, 405, { error: "Method not allowed" }, { allow: "POST" });
