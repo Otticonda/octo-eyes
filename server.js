@@ -17,7 +17,7 @@ const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const SECRET = (process.env.OCTO_SECRET || "").trim();
 const MCP_PATH = SECRET ? `/mcp/${SECRET}` : "/mcp";
 const STREAM_URL = "wss://pumpportal.fun/api/data";
-const VERSION = "3.4.0";
+const VERSION = "3.4.1";
 const PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
 const CA_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -357,7 +357,18 @@ async function candles(ca, timeframe = "5m", limit = 120) {
       following: true,
       candles: list,
       note: list.length ? undefined : wasFollowing ? "No trades on this coin in the last 15 minutes." : "Started following this coin's trades; 1s candles appear as trades come in.",
+      stream: { state: streamState, tradeMessages: tradeMsgs, onFollowedCoins: followedTradeMsgs, droppedNoSolPrice: droppedNoPrice, solUsd: solUsdNow, following: tradeSubs.size, replies: streamNotes.slice(0, 4) },
     };
+  }
+  if (ca === "So11111111111111111111111111111111111111112") {
+    const mins = { "1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440 }[tf];
+    return cached(`kraken:${tf}:${n}`, 30_000, async () => {
+      const j = await getJSON(`https://api.kraken.com/0/public/OHLC?pair=SOLUSD&interval=${mins}`, {}, 10000);
+      if (j.error?.length) throw new Error("Kraken: " + j.error.join(", "));
+      const k = Object.keys(j.result || {}).find((x) => x !== "last");
+      const list = (j.result?.[k] || []).slice(-n).map((r) => ({ t: r[0] * 1000, o: Number(r[1]), h: Number(r[2]), l: Number(r[3]), c: Number(r[4]), v: Number(r[6]) * Number(r[4]) }));
+      return { found: list.length > 0, source: "Kraken SOL/USD", timeframe: tf, candles: list };
+    });
   }
   return cached(`ohlcv:${ca}:${tf}:${n}`, 20_000, async () => {
     const solUsd = await solPriceUsd().catch(() => null);
@@ -426,6 +437,12 @@ async function marketData(ca) {
 async function solPriceUsd() {
   return cached("solusd", 60_000, async () => {
     const SOL = "So11111111111111111111111111111111111111112";
+    try {
+      const k = await getJSON("https://api.kraken.com/0/public/Ticker?pair=SOLUSD", {}, 6000, 0);
+      const key = Object.keys(k?.result || {})[0];
+      const v = Number(k?.result?.[key]?.c?.[0]);
+      if (v > 0) return v;
+    } catch {}
     try {
       const j = await getJSON(`https://api.geckoterminal.com/api/v2/simple/networks/solana/token_price/${SOL}`);
       const v = Number(j?.data?.attributes?.token_prices?.[SOL]);
@@ -760,6 +777,10 @@ async function tokenReport(ca) {
 const MAX_TRADE_SUBS = 12;
 const tradeSubs = new Map(); // mint -> last time something asked for it
 const tradeBuf = new Map(); // mint -> [{t, p (USD), v (USD)}]
+const streamNotes = []; // PumpPortal's own replies (subscribe confirmations, errors)
+let tradeMsgs = 0;
+let followedTradeMsgs = 0;
+let droppedNoPrice = 0;
 let solUsdNow = null;
 setInterval(() => solPriceUsd().then((v) => v && (solUsdNow = v)).catch(() => {}), 60_000);
 solPriceUsd().then((v) => v && (solUsdNow = v)).catch(() => {});
@@ -782,7 +803,10 @@ function followTrades(mint, keep = false) {
 function recordTrade(m) {
   const vSol = Number(m.vSolInBondingCurve), vTok = Number(m.vTokensInBondingCurve);
   const priceSol = vSol > 0 && vTok > 0 ? vSol / vTok : Number(m.marketCapSol) > 0 ? Number(m.marketCapSol) / 1e9 : null;
-  if (!(priceSol > 0) || !solUsdNow) return;
+  if (!(priceSol > 0) || !solUsdNow) {
+    droppedNoPrice++;
+    return;
+  }
   let b = tradeBuf.get(m.mint);
   if (!b) tradeBuf.set(m.mint, (b = []));
   b.push({ t: Date.now(), p: priceSol * solUsdNow, v: (Number(m.solAmount) || 0) * solUsdNow });
@@ -847,6 +871,15 @@ function connectStream() {
       m = JSON.parse(typeof ev.data === "string" ? ev.data : ev.data.toString());
     } catch {
       return;
+    }
+    if (!m.txType) {
+      streamNotes.unshift({ at: new Date().toISOString(), message: String(m.message || m.error || JSON.stringify(m)).slice(0, 200) });
+      if (streamNotes.length > 8) streamNotes.pop();
+      return;
+    }
+    if (m.txType === "buy" || m.txType === "sell") {
+      tradeMsgs++;
+      if (m.mint && tradeSubs.has(m.mint)) followedTradeMsgs++;
     }
     if (m.txType === "create" && m.mint) {
       launches.unshift({
@@ -1458,7 +1491,7 @@ async function computeDial() {
         const w = walcl.find((x) => x.date === date)?.value;
         const t = onOrBefore(tga, date);
         const r = onOrBefore(rrp, date);
-        return w == null || t == null || r == null ? null : w / 1000 - t - r; // WALCL is millions, the others billions
+        return w == null || t == null || r == null ? null : w / 1000 - t / 1000 - r; // WALCL and WTREGEN are millions, RRPONTSYD billions
       };
       const lastDate = walcl.at(-1).date;
       const prevDate = walcl.at(-5).date;
@@ -1870,7 +1903,7 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://localhost");
 
   if (url.pathname === "/" || url.pathname === "/health") {
-    return send(res, 200, { name: "Octo Eyes", version: VERSION, ok: true, rpc: RPC_KIND, stream: streamState, launchesSeen: launches.length, watching: watched.size, mode: PAPER ? "paper" : "live", wallet: PAPER ? "paper" : wallet ? wallet.publicKey : walletError ? "error: " + walletError : "not set", trading: PAPER || wallet ? (tradingOn ? "on" : "paused") : "off", autoPaper: AUTO_PAPER ? "on" : "off", memeDial: dialCache?.memeDial ?? null, openPositions: positions.size, scannerTracking: scan.size, journalTrades: closedTrades.length });
+    return send(res, 200, { name: "Octo Eyes", version: VERSION, ok: true, rpc: RPC_KIND, stream: streamState, tradeMessages: tradeMsgs, followingTrades: tradeSubs.size, streamReplies: streamNotes.slice(0, 3), launchesSeen: launches.length, watching: watched.size, mode: PAPER ? "paper" : "live", wallet: PAPER ? "paper" : wallet ? wallet.publicKey : walletError ? "error: " + walletError : "not set", trading: PAPER || wallet ? (tradingOn ? "on" : "paused") : "off", autoPaper: AUTO_PAPER ? "on" : "off", memeDial: dialCache?.memeDial ?? null, openPositions: positions.size, scannerTracking: scan.size, journalTrades: closedTrades.length });
   }
   if (url.pathname !== MCP_PATH) return send(res, 404, { error: "Not found" });
   if (req.method === "GET" || req.method === "DELETE") return send(res, 405, { error: "Method not allowed" }, { allow: "POST" });
