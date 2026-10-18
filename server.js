@@ -17,7 +17,7 @@ const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const SECRET = (process.env.OCTO_SECRET || "").trim();
 const MCP_PATH = SECRET ? `/mcp/${SECRET}` : "/mcp";
 const STREAM_URL = "wss://pumpportal.fun/api/data";
-const VERSION = "3.0.1";
+const VERSION = "3.1.0";
 const PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
 const CA_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -748,12 +748,28 @@ const LIMITS = {
   stopLossPct: numEnv("STOP_LOSS_PCT", 35),
   maxHoldHours: numEnv("MAX_HOLD_HOURS", 12),
 };
-let tradingOn = /^(1|true|on|yes)$/i.test(process.env.TRADING_ENABLED || "");
+// Paper mode is the default: real fills only with PAPER_MODE=false AND a wallet AND trading on.
+const PAPER = !/^(0|false|off|no)$/i.test(process.env.PAPER_MODE || "");
+const PAPER_START_SOL = numEnv("PAPER_START_SOL", 1);
+const PAPER_COST = numEnv("PAPER_COST_PCT", 3) / 100; // fee + slippage charged on each side of a paper fill
+const AUTO_PAPER = PAPER && !/^(0|false|off|no)$/i.test(process.env.AUTO_PAPER || "");
+const RULES = {
+  standDownBelow: 0.5, // meme dial under this: no buys today
+  maxPoolSharePct: numEnv("MAX_POOL_SHARE_PCT", 2), // never more than this % of the pool, or you are the exit
+  minTicketSol: numEnv("MIN_TICKET_SOL", 0.005),
+  maxDailyLossSol: numEnv("MAX_DAILY_LOSS_SOL", 0.1), // realized loss that makes the desk flat until tomorrow (UTC)
+  volumeDeadRatio: numEnv("VOLUME_DEAD_RATIO", 0.2), // last hour's volume vs the coin's average hour
+};
+const paper = { cashSol: PAPER_START_SOL, startedAt: new Date().toISOString() };
+const offWords = /^(0|false|off|no)$/i;
+let tradingOn = PAPER ? !offWords.test(process.env.TRADING_ENABLED || "") : /^(1|true|on|yes)$/i.test(process.env.TRADING_ENABLED || "");
 const positions = new Map(); // mint -> position
 const tradeLog = [];
 const closedTrades = []; // the journal Octo learns from
+const rejections = []; // every buy that was refused and why: data for checking the rules
 let spentDay = new Date().toISOString().slice(0, 10);
 let spentToday = 0;
+let realizedToday = 0;
 let tradeLock = Promise.resolve();
 
 function loadWallet() {
@@ -804,6 +820,7 @@ function signTx(txBytes, w) {
 }
 
 async function solBalance() {
+  if (PAPER) return paper.cashSol;
   const r = await rpc("getBalance", [wallet.publicKey]);
   return (r?.value ?? 0) / 1e9;
 }
@@ -877,7 +894,12 @@ function rollDay() {
   if (d !== spentDay) {
     spentDay = d;
     spentToday = 0;
+    realizedToday = 0;
   }
+}
+function logReject(mint, reason, extra = {}) {
+  rejections.unshift({ at: new Date().toISOString(), mint, reason, ...extra });
+  if (rejections.length > 200) rejections.pop();
 }
 const withLock = (fn) => {
   const p = tradeLock.then(fn, fn);
@@ -886,6 +908,7 @@ const withLock = (fn) => {
 };
 
 function needWallet() {
+  if (PAPER) return;
   if (!wallet) throw new Error(walletError || "No trading wallet set. Add OCTO_WALLET_KEY in Render's Environment settings.");
 }
 
@@ -913,15 +936,53 @@ function compactSignals(r) {
   };
 }
 
-async function buy(mint, sol, reason, score) {
+// SOL in the coin's pool: the bonding curve's SOL while on pump.fun, otherwise the DEX pool's liquidity in SOL.
+async function poolSol(mint) {
+  try {
+    const c = await chainPump(mint);
+    if (c.found && !c.migrated && c.solInCurve != null) return c.solInCurve;
+  } catch {}
+  const [m, sol] = await Promise.all([marketData(mint).catch(() => null), solPriceUsd()]);
+  if (m?.liquidityUsd && sol) return m.liquidityUsd / sol;
+  return null;
+}
+
+// Every refused buy lands in the rejection log, so the rules themselves can be checked later.
+async function buy(mint, sol, reason, score, source = "chat") {
+  try {
+    return await buyInner(mint, sol, reason, score, source);
+  } catch (e) {
+    logReject(mint, e.message, { source });
+    throw e;
+  }
+}
+
+async function buyInner(mint, sol, reason, score, source) {
   needWallet();
-  if (!tradingOn) throw new Error("Trading is paused. Turn it on with set_trading, or set TRADING_ENABLED=true on Render.");
+  if (!tradingOn) throw new Error("Trading is paused. Turn it on with set_trading, or set TRADING_ENABLED on Render.");
+  const dial = await riskDial();
+  if (!(dial.memeDial >= RULES.standDownBelow)) {
+    throw new Error(`Stand-down day: the meme dial is ${dial.memeDial} (buys need ${RULES.standDownBelow}+). Red: ${dial.red.join(", ") || "none"}.`);
+  }
   return withLock(async () => {
     rollDay();
-    const amt = Math.min(Number(sol) || LIMITS.maxBuySol, LIMITS.maxBuySol);
-    if (!(amt > 0)) throw new Error("Buy amount must be above 0.");
+    if (realizedToday <= -RULES.maxDailyLossSol) {
+      throw new Error(`Flat until tomorrow (UTC): today's realized loss is ${round(-realizedToday, 4)} SOL, the limit is ${RULES.maxDailyLossSol} SOL.`);
+    }
+    const asked = Math.min(Number(sol) || LIMITS.maxBuySol, LIMITS.maxBuySol);
+    if (!(asked > 0)) throw new Error("Buy amount must be above 0.");
     if (positions.has(mint)) throw new Error("Octo already holds this coin.");
     if (positions.size >= LIMITS.maxOpenPositions) throw new Error(`Already at the limit of ${LIMITS.maxOpenPositions} open positions.`);
+
+    // Size: the request, times the dial, capped at a slice of the pool so Octo is never the exit.
+    const pool = await poolSol(mint).catch(() => null);
+    const poolCap = pool != null ? (pool * RULES.maxPoolSharePct) / 100 : null;
+    let amt = asked * dial.memeDial;
+    if (poolCap != null) amt = Math.min(amt, poolCap);
+    amt = Math.floor(amt * 1e4) / 1e4;
+    if (amt < RULES.minTicketSol) {
+      throw new Error(`Ticket too small: ${amt} SOL after the dial (${dial.memeDial}) and the ${RULES.maxPoolSharePct}% pool cap (pool ${round(pool, 2)} SOL). Minimum is ${RULES.minTicketSol}.`);
+    }
     if (spentToday + amt > LIMITS.dailyBudgetSol + 1e-9) throw new Error(`Daily budget reached (${round(spentToday, 3)} of ${LIMITS.dailyBudgetSol} SOL spent today).`);
     const bal = await solBalance();
     if (bal - amt - LIMITS.priorityFeeSol < LIMITS.reserveSol) throw new Error(`Not enough SOL: wallet has ${round(bal, 4)} SOL and keeps ${LIMITS.reserveSol} SOL for fees.`);
@@ -930,27 +991,43 @@ async function buy(mint, sol, reason, score) {
     if (safety?.mintAuthority) throw new Error("Refused: mint authority is still on (more tokens can be printed).");
     if (safety?.freezeAuthority) throw new Error("Refused: freeze authority is on (honeypot risk).");
 
-    const before = await tokenBalance(mint);
-    const sig = await swap("buy", mint, amt);
-    let after = await tokenBalance(mint);
-    for (let i = 0; i < 4 && after.ui <= before.ui; i++) {
-      await new Promise((r) => setTimeout(r, 2000));
-      after = await tokenBalance(mint);
+    let sig;
+    let tokens;
+    let costSol = amt;
+    if (PAPER) {
+      const price = await priceInSol(mint);
+      if (!(price > 0)) throw new Error("Couldn't price this coin for a paper fill.");
+      tokens = (amt * (1 - PAPER_COST)) / price;
+      costSol = round(amt + LIMITS.priorityFeeSol, 6);
+      paper.cashSol = round(paper.cashSol - costSol, 6);
+      sig = "paper-" + crypto.randomUUID().slice(0, 8);
+    } else {
+      const before = await tokenBalance(mint);
+      sig = await swap("buy", mint, amt);
+      let after = await tokenBalance(mint);
+      for (let i = 0; i < 4 && after.ui <= before.ui; i++) {
+        await new Promise((r) => setTimeout(r, 2000));
+        after = await tokenBalance(mint);
+      }
+      tokens = after.ui - before.ui;
     }
-    const tokens = after.ui - before.ui;
     spentToday += amt;
     const pos = {
       mint,
       name: null,
       symbol: null,
+      mode: PAPER ? "paper" : "live",
+      source,
       tokens,
-      costSol: amt,
+      costSol,
       soldSol: 0,
-      entryPriceSol: tokens > 0 ? amt / tokens : null,
+      entryPriceSol: tokens > 0 ? costSol / tokens : null,
       soldHalf: false,
       openedAt: new Date().toISOString(),
       reason: String(reason || "").slice(0, 200),
       sendScore: Number.isFinite(Number(score)) ? Number(score) : null,
+      dialAtEntry: dial.memeDial,
+      sizing: { askedSol: asked, dial: dial.memeDial, poolSol: round(pool, 3), poolCapSol: round(poolCap, 4), finalSol: amt },
       entrySignals: null,
     };
     positions.set(mint, pos);
@@ -962,51 +1039,95 @@ async function buy(mint, sol, reason, score) {
         pos.symbol = r?.market?.symbol || r?.pumpfun?.symbol || null;
       })
       .catch(() => {});
-    logTrade({ side: "buy", mint, sol: amt, tokens, signature: sig, reason: pos.reason });
-    return { ok: true, signature: sig, solscan: `https://solscan.io/tx/${sig}`, position: pos, spentToday: round(spentToday, 3) };
+    logTrade({ side: "buy", mode: pos.mode, mint, sol: amt, tokens, signature: sig, reason: pos.reason });
+    return {
+      ok: true,
+      mode: pos.mode,
+      signature: sig,
+      solscan: PAPER ? null : `https://solscan.io/tx/${sig}`,
+      position: pos,
+      spentToday: round(spentToday, 3),
+      ...(PAPER ? { paperCashSol: paper.cashSol } : {}),
+    };
   });
 }
 
 async function sell(mint, percent, why) {
   needWallet();
   return withLock(async () => {
+    rollDay();
     const pct = Math.max(1, Math.min(100, Math.round(Number(percent) || 100)));
-    const bal = await tokenBalance(mint);
-    if (!(bal.ui > 0)) {
-      positions.delete(mint);
-      throw new Error("Octo's wallet holds none of this coin.");
-    }
-    const solBefore = await solBalance();
-    const sig = await swap("sell", mint, `${pct}%`);
-    const solAfter = await solBalance().catch(() => null);
-    const received = solAfter != null ? round(solAfter - solBefore, 4) : null;
     const pos = positions.get(mint);
+    let sig;
+    let received;
+    if (PAPER) {
+      if (!pos || !(pos.tokens > 0)) {
+        positions.delete(mint);
+        throw new Error("Octo's paper wallet holds none of this coin.");
+      }
+      const price = await priceInSol(mint).catch(() => null);
+      const ageH = (Date.now() - Date.parse(pos.openedAt)) / 3.6e6;
+      if (!(price > 0)) {
+        // A coin that can't be priced after the max hold is treated as dead: written off at zero.
+        if (ageH < LIMITS.maxHoldHours) throw new Error("Couldn't price this coin for a paper sell right now.");
+        received = 0;
+      } else {
+        const qty = (pos.tokens * pct) / 100;
+        received = Math.max(0, round(qty * price * (1 - PAPER_COST) - LIMITS.priorityFeeSol, 6));
+      }
+      paper.cashSol = round(paper.cashSol + received, 6);
+      sig = "paper-" + crypto.randomUUID().slice(0, 8);
+    } else {
+      const bal = await tokenBalance(mint);
+      if (!(bal.ui > 0)) {
+        positions.delete(mint);
+        throw new Error("Octo's wallet holds none of this coin.");
+      }
+      const solBefore = await solBalance();
+      sig = await swap("sell", mint, `${pct}%`);
+      const solAfter = await solBalance().catch(() => null);
+      received = solAfter != null ? round(solAfter - solBefore, 4) : null;
+    }
     if (pos) {
-      pos.soldSol = round((pos.soldSol || 0) + (received || 0), 4);
+      pos.soldSol = round((pos.soldSol || 0) + (received || 0), 6);
       if (pct >= 100) {
         positions.delete(mint);
+        const pnlSol = round(pos.soldSol - pos.costSol, 6);
+        realizedToday += pnlSol;
         closedTrades.unshift({
           mint,
           name: pos.name,
           symbol: pos.symbol,
+          mode: pos.mode || (PAPER ? "paper" : "live"),
+          source: pos.source || null,
           openedAt: pos.openedAt,
           closedAt: new Date().toISOString(),
           holdHours: round((Date.now() - Date.parse(pos.openedAt)) / 3.6e6, 2),
           costSol: pos.costSol,
           returnedSol: pos.soldSol,
-          pnlSol: round(pos.soldSol - pos.costSol, 4),
+          pnlSol,
           multiple: pos.costSol ? round(pos.soldSol / pos.costSol, 2) : null,
           won: pos.soldSol > pos.costSol,
           exitReason: why || "manual",
           buyReason: pos.reason,
           sendScore: pos.sendScore,
+          dialAtEntry: pos.dialAtEntry ?? null,
+          sizing: pos.sizing ?? null,
           entrySignals: pos.entrySignals,
         });
         if (closedTrades.length > 200) closedTrades.pop();
       } else pos.tokens = Math.max(0, pos.tokens * (1 - pct / 100));
     }
-    logTrade({ side: "sell", mint, percent: pct, solReceived: received, signature: sig, reason: why || "manual" });
-    return { ok: true, signature: sig, solscan: `https://solscan.io/tx/${sig}`, percentSold: pct, solReceived: received };
+    logTrade({ side: "sell", mode: PAPER ? "paper" : "live", mint, percent: pct, solReceived: received, signature: sig, reason: why || "manual" });
+    return {
+      ok: true,
+      mode: PAPER ? "paper" : "live",
+      signature: sig,
+      solscan: PAPER ? null : `https://solscan.io/tx/${sig}`,
+      percentSold: pct,
+      solReceived: received,
+      ...(PAPER ? { paperCashSol: paper.cashSol } : {}),
+    };
   });
 }
 
@@ -1021,25 +1142,56 @@ async function walletStatus() {
   needWallet();
   rollDay();
   const [bal, views] = await Promise.all([solBalance(), Promise.all([...positions.values()].map(positionView))]);
+  const held = views.reduce((s, v) => s + (v.valueSol || 0), 0);
   return {
-    address: wallet.publicKey,
+    mode: PAPER ? "paper (simulated fills, no real SOL)" : "live",
+    address: PAPER ? null : wallet.publicKey,
     solBalance: round(bal, 4),
+    ...(PAPER
+      ? {
+          paperStartSol: PAPER_START_SOL,
+          paperEquitySol: round(bal + held, 4),
+          paperReturnPct: round(((bal + held) / PAPER_START_SOL - 1) * 100, 2),
+          paperSince: paper.startedAt,
+          paperCostPctPerSide: PAPER_COST * 100,
+          autoPaper: AUTO_PAPER ? "on" : "off",
+        }
+      : {}),
     trading: tradingOn ? "on" : "paused",
     spentToday: round(spentToday, 3),
+    realizedTodaySol: round(realizedToday, 4),
     limits: LIMITS,
+    rules: RULES,
     openPositions: views,
     recentTrades: tradeLog.slice(0, 15),
   };
 }
 
-// Automatic exits: take profit, stop loss, max hold time. Runs every 20 seconds.
+// Is the coin's trading drying up? Last hour's volume against its average hour (over up to 6h).
+async function volumeDying(mint) {
+  const m = await marketData(mint).catch(() => null);
+  const h1 = m?.stats1h;
+  const h6 = m?.stats6h;
+  if (!h1 || !h6) return null;
+  const v1 = (h1.buyVolumeUsd || 0) + (h1.sellVolumeUsd || 0);
+  const v6 = (h6.buyVolumeUsd || 0) + (h6.sellVolumeUsd || 0);
+  const hours = Math.min(6, Math.max(1, Number(m.ageHours) || 6));
+  if (!(v6 > 0) || hours < 2) return null; // too young to have a normal pace
+  const ratio = v1 / (v6 / hours);
+  return { ratio: round(ratio, 2), dying: ratio < RULES.volumeDeadRatio };
+}
+
+// Automatic exits: stop loss, take profit, volume dying, max hold time. Runs every 20 seconds.
 async function exitLoop() {
-  if (!wallet || !positions.size) return;
+  if ((!wallet && !PAPER) || !positions.size) return;
   for (const p of [...positions.values()]) {
     try {
       const v = await positionView(p);
       const ageH = (Date.now() - Date.parse(p.openedAt)) / 3.6e6;
-      if (v.multiple == null) continue;
+      if (v.multiple == null) {
+        if (ageH >= LIMITS.maxHoldHours) await sell(p.mint, 100, `held ${round(ageH, 1)}h and can't be priced, closing`);
+        continue;
+      }
       if (v.multiple <= 1 - LIMITS.stopLossPct / 100) await sell(p.mint, 100, `stop loss at ${v.pnlPct}%`);
       else if (v.multiple >= LIMITS.takeProfit2X) await sell(p.mint, 100, `take profit at ${v.multiple}x`);
       else if (!p.soldHalf && v.multiple >= LIMITS.takeProfit1X) {
@@ -1047,10 +1199,177 @@ async function exitLoop() {
         const still = positions.get(p.mint);
         if (still) still.soldHalf = true;
       } else if (ageH >= LIMITS.maxHoldHours) await sell(p.mint, 100, `held ${round(ageH, 1)}h, closing`);
+      else if (!p.lastVolumeCheck || Date.now() - p.lastVolumeCheck > 5 * 60_000) {
+        p.lastVolumeCheck = Date.now();
+        const vol = await volumeDying(p.mint);
+        if (vol?.dying) await sell(p.mint, 100, `volume dried up (last hour ${vol.ratio}x its normal pace)`);
+      }
     } catch (e) {
       logTrade({ side: "error", mint: p.mint, error: e.message });
     }
   }
+}
+
+// ---------------------------------------------------------------- risk dial
+// One number for how hard Octo may push today, from the market around the coins, not the coins.
+// Inputs (green or red): BTC above its 200-day average, SOL above its 50-day, VIX under 22,
+// and US net liquidity (Fed balance sheet minus TGA minus reverse repo) rising over 4 weeks.
+// Dial = share of greens. Anything that can't be read or is stale counts as red, never green.
+async function getText(url, timeoutMs = 12000) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: ctl.signal, headers: { "user-agent": "octo-eyes/" + VERSION } });
+    if (!res.ok) throw new Error(`${new URL(url).host} answered ${res.status}`);
+    return await res.text();
+  } catch (e) {
+    if (e.name === "AbortError") throw new Error(`${new URL(url).host} timed out`);
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Completed daily closes, oldest first, with the date of the last one.
+async function dailyCloses(asset) {
+  const kraken = { BTC: "XBTUSD", SOL: "SOLUSD" }[asset];
+  const gecko = { BTC: "bitcoin", SOL: "solana" }[asset];
+  try {
+    const j = await getJSON(`https://api.kraken.com/0/public/OHLC?pair=${kraken}&interval=1440`, {}, 10000);
+    if (j.error?.length) throw new Error(j.error.join(", "));
+    const k = Object.keys(j.result || {}).find((x) => x !== "last");
+    const rows = (j.result?.[k] || []).slice(0, -1); // the last candle is today's, still open
+    if (rows.length < 210) throw new Error("not enough history");
+    return { source: "Kraken", closes: rows.map((r) => Number(r[4])), lastDate: new Date(rows[rows.length - 1][0] * 1000).toISOString().slice(0, 10) };
+  } catch (e) {
+    const j = await getJSON(`https://api.coingecko.com/api/v3/coins/${gecko}/market_chart?vs_currency=usd&days=260&interval=daily`, {}, 10000);
+    const rows = (j.prices || []).slice(0, -1);
+    if (rows.length < 210) throw new Error(`${asset} price history unavailable (Kraken: ${e.message})`);
+    return { source: "CoinGecko", closes: rows.map((r) => Number(r[1])), lastDate: new Date(rows[rows.length - 1][0]).toISOString().slice(0, 10) };
+  }
+}
+
+async function fredSeries(id, sinceDays = 120) {
+  const start = new Date(Date.now() - sinceDays * 864e5).toISOString().slice(0, 10);
+  const csv = await getText(`https://fred.stlouisfed.org/graph/fredgraph.csv?id=${id}&cosd=${start}`);
+  return csv
+    .trim()
+    .split(/\r?\n/)
+    .slice(1)
+    .map((l) => l.split(","))
+    .filter(([d, v]) => d && v && v !== "." && Number.isFinite(Number(v)))
+    .map(([d, v]) => ({ date: d, value: Number(v) }));
+}
+
+const ageDays = (date) => (Date.now() - Date.parse(date + "T00:00:00Z")) / 864e5;
+const sma = (arr, n) => arr.slice(-n).reduce((s, x) => s + x, 0) / n;
+
+async function computeDial() {
+  const inputs = {};
+  const check = async (name, fn) => {
+    try {
+      inputs[name] = await fn();
+    } catch (e) {
+      inputs[name] = { green: false, degraded: true, error: e.message };
+    }
+  };
+  await Promise.all([
+    check("btc_above_200d", async () => {
+      const d = await dailyCloses("BTC");
+      const last = d.closes.at(-1);
+      const avg = sma(d.closes, 200);
+      const stale = ageDays(d.lastDate) > 3;
+      return { green: !stale && last > avg, degraded: stale, close: round(last, 0), avg200: round(avg, 0), vsAvgPct: round((last / avg - 1) * 100, 2), asOf: d.lastDate, source: d.source };
+    }),
+    check("sol_above_50d", async () => {
+      const d = await dailyCloses("SOL");
+      const last = d.closes.at(-1);
+      const avg = sma(d.closes, 50);
+      const stale = ageDays(d.lastDate) > 3;
+      return { green: !stale && last > avg, degraded: stale, close: round(last, 2), avg50: round(avg, 2), vsAvgPct: round((last / avg - 1) * 100, 2), asOf: d.lastDate, source: d.source };
+    }),
+    check("vix_under_22", async () => {
+      const s = await fredSeries("VIXCLS", 30);
+      const last = s.at(-1);
+      if (!last) throw new Error("no VIX data");
+      const stale = ageDays(last.date) > 5; // weekends and holidays
+      return { green: !stale && last.value < 22, degraded: stale, vix: last.value, asOf: last.date };
+    }),
+    check("net_liquidity_rising", async () => {
+      const [walcl, tga, rrp] = await Promise.all([fredSeries("WALCL", 90), fredSeries("WTREGEN", 90), fredSeries("RRPONTSYD", 90)]);
+      if (walcl.length < 5) throw new Error("not enough Fed balance sheet data");
+      const onOrBefore = (s, date) => [...s].reverse().find((x) => x.date <= date)?.value;
+      const net = (date) => {
+        const w = walcl.find((x) => x.date === date)?.value;
+        const t = onOrBefore(tga, date);
+        const r = onOrBefore(rrp, date);
+        return w == null || t == null || r == null ? null : w / 1000 - t - r; // WALCL is millions, the others billions
+      };
+      const lastDate = walcl.at(-1).date;
+      const prevDate = walcl.at(-5).date;
+      const now = net(lastDate);
+      const then = net(prevDate);
+      if (now == null || then == null) throw new Error("couldn't line up the liquidity series");
+      const stale = ageDays(lastDate) > 12; // weekly series, published with a lag
+      return { green: !stale && now - then > 0, degraded: stale, netLiquidityBn: round(now, 1), change4wBn: round(now - then, 1), asOf: lastDate };
+    }),
+  ]);
+  const names = Object.keys(inputs);
+  const greens = names.filter((n) => inputs[n].green);
+  return {
+    computedAt: new Date().toISOString(),
+    memeDial: greens.length / names.length, // never rounded up
+    standDown: greens.length / names.length < RULES.standDownBelow,
+    green: greens,
+    red: names.filter((n) => !inputs[n].green),
+    inputs,
+  };
+}
+
+let dialCache = null;
+async function riskDial(fresh = false) {
+  if (!fresh && dialCache && Date.now() - Date.parse(dialCache.computedAt) < 3 * 3.6e6) return dialCache;
+  dialCache = await computeDial();
+  return dialCache;
+}
+
+// ---------------------------------------------------------------- auto paper trader
+// Paper only. Every 5 minutes: the scanner's top picks, a full token report on the best,
+// and a paper buy if it passes plain rules. It is the baseline Octo's own calls have to beat.
+let autoState = { lastRun: null, lastResult: null };
+async function autoPaperTick() {
+  if (!AUTO_PAPER || !tradingOn) return;
+  rollDay();
+  autoState.lastRun = new Date().toISOString();
+  if (positions.size >= LIMITS.maxOpenPositions) return (autoState.lastResult = "positions full");
+  if (spentToday + RULES.minTicketSol > LIMITS.dailyBudgetSol) return (autoState.lastResult = "daily budget used");
+  const dial = await riskDial().catch(() => null);
+  if (!dial || dial.standDown) return (autoState.lastResult = `stand-down (dial ${dial?.memeDial ?? "unreadable"})`);
+  const { picks } = await scannerPicks(5);
+  const fresh = picks.filter((p) => !positions.has(p.mint) && !closedTrades.some((t) => t.mint === p.mint) && !rejections.some((r) => r.mint === p.mint));
+  for (const pick of fresh.slice(0, 2)) {
+    const r = await tokenReport(pick.mint).catch(() => null);
+    const s = compactSignals(r);
+    const why = [];
+    if (!s) why.push("no report");
+    else {
+      if (s.risk !== "low") why.push(`rug radar ${s.risk} (${s.riskScore})`);
+      if (s.top10HoldersPct != null && s.top10HoldersPct > 30) why.push(`top 10 hold ${s.top10HoldersPct}%`);
+      if (s.devHoldingPct != null && s.devHoldingPct > 5) why.push(`dev holds ${s.devHoldingPct}%`);
+      if (s.bundledPct != null && s.bundledPct > 10) why.push(`bundled ${s.bundledPct}%`);
+    }
+    if (why.length) {
+      logReject(pick.mint, "auto: " + why.join("; "), { source: "auto", momentumScore: pick.momentumScore });
+      continue;
+    }
+    try {
+      await buy(pick.mint, LIMITS.maxBuySol, `auto: scanner momentum ${pick.momentumScore}, rug radar low`, null, "auto");
+      return (autoState.lastResult = `bought ${pick.symbol || pick.mint}`);
+    } catch (e) {
+      return (autoState.lastResult = "buy refused: " + e.message);
+    }
+  }
+  autoState.lastResult = fresh.length ? "no pick passed the rules" : "no new picks";
 }
 
 // After a restart, rebuild positions from the coins actually in the wallet.
@@ -1143,8 +1462,7 @@ async function scannerPicks(limit = 5) {
   };
 }
 
-function journalStats() {
-  const t = closedTrades;
+function journalStats(t = closedTrades) {
   if (!t.length) return { trades: 0 };
   const wins = t.filter((x) => x.won).length;
   return {
@@ -1242,7 +1560,7 @@ const TOOLS = [
   },
   {
     name: "buy",
-    description: "Buy a Solana token with Octo's wallet. Capped by server limits (max SOL per buy, daily budget, max open positions); refuses tokens with mint or freeze authority on. Exits (take profit, stop loss, max hold) then run automatically.",
+    description: "Buy a Solana token with Octo's wallet (simulated fills while the server is in paper mode). Refused on a stand-down day (risk dial under 0.5) or after the daily loss limit. Size = requested SOL (capped at the per-buy limit) x the risk dial, capped at 2% of the coin's pool. Also capped by the daily budget and max open positions; refuses tokens with mint or freeze authority on. Exits (stop loss, take profit, volume dying, max hold) then run automatically. Every refusal is logged in the trade journal.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1275,7 +1593,25 @@ const TOOLS = [
     name: "trade_journal",
     description: "Octo's trade journal: every closed trade with cost, return, multiple, exit reason, send score and the coin's signals at entry, plus win rate and total P&L. Use it to learn which signals actually led to wins.",
     inputSchema: { type: "object", properties: { limit: { type: "integer", minimum: 1, maximum: 200, description: "How many closed trades (default 50)." } } },
-    run: async ({ limit = 50 } = {}) => ({ stats: journalStats(), closedTrades: closedTrades.slice(0, Math.max(1, Math.min(200, Number(limit) || 50))), openPositions: [...positions.values()] }),
+    run: async ({ limit = 50 } = {}) => {
+      const n = Math.max(1, Math.min(200, Number(limit) || 50));
+      const by = (src) => journalStats(closedTrades.filter((t) => (t.source || "chat") === src));
+      return {
+        mode: PAPER ? "paper" : "live",
+        stats: journalStats(),
+        statsBySource: { chat: by("chat"), auto: by("auto") },
+        ...(PAPER ? { paperCashSol: paper.cashSol, paperStartSol: PAPER_START_SOL, paperSince: paper.startedAt, autoPaper: { on: AUTO_PAPER, ...autoState } } : {}),
+        closedTrades: closedTrades.slice(0, n),
+        openPositions: [...positions.values()],
+        rejections: rejections.slice(0, Math.min(n, 50)),
+      };
+    },
+  },
+  {
+    name: "risk_dial",
+    description: "Today's meme risk dial (0 to 1): the share of green market conditions — BTC above its 200-day average, SOL above its 50-day, VIX under 22, US net liquidity rising over 4 weeks. Under 0.5 is a stand-down day and buys are refused; otherwise buy size is multiplied by the dial. Unreadable or stale inputs count as red. Recomputed every 3 hours.",
+    inputSchema: { type: "object", properties: { fresh: { type: "boolean", description: "Recompute now instead of using the last reading." } } },
+    run: async ({ fresh = false } = {}) => riskDial(!!fresh),
   },
   {
     name: "set_trading",
@@ -1352,7 +1688,7 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://localhost");
 
   if (url.pathname === "/" || url.pathname === "/health") {
-    return send(res, 200, { name: "Octo Eyes", version: VERSION, ok: true, rpc: RPC_KIND, stream: streamState, launchesSeen: launches.length, watching: watched.size, wallet: wallet ? wallet.publicKey : walletError ? "error: " + walletError : "not set", trading: wallet ? (tradingOn ? "on" : "paused") : "off", openPositions: positions.size, scannerTracking: scan.size, journalTrades: closedTrades.length });
+    return send(res, 200, { name: "Octo Eyes", version: VERSION, ok: true, rpc: RPC_KIND, stream: streamState, launchesSeen: launches.length, watching: watched.size, mode: PAPER ? "paper" : "live", wallet: PAPER ? "paper" : wallet ? wallet.publicKey : walletError ? "error: " + walletError : "not set", trading: PAPER || wallet ? (tradingOn ? "on" : "paused") : "off", autoPaper: AUTO_PAPER ? "on" : "off", memeDial: dialCache?.memeDial ?? null, openPositions: positions.size, scannerTracking: scan.size, journalTrades: closedTrades.length });
   }
   if (url.pathname !== MCP_PATH) return send(res, 404, { error: "Not found" });
   if (req.method === "GET" || req.method === "DELETE") return send(res, 405, { error: "Method not allowed" }, { allow: "POST" });
@@ -1379,12 +1715,18 @@ server.listen(PORT, () => {
     connectStream();
     setInterval(() => scanTick().catch(() => {}), 45_000);
   } else streamState = "off";
-  if (wallet) {
+  if (PAPER) {
+    console.log(`Paper mode: ${PAPER_START_SOL} SOL simulated bank, trading ${tradingOn ? "on" : "paused"}, auto paper ${AUTO_PAPER ? "on" : "off"}`);
+    if (AUTO_PAPER && process.env.OCTO_NO_STREAM !== "1") setInterval(() => autoPaperTick().catch((e) => (autoState.lastResult = "error: " + e.message)), 5 * 60_000);
+  } else if (wallet) {
     console.log(`Trading wallet ${wallet.publicKey}, trading ${tradingOn ? "on" : "paused"}`);
     recoverPositions();
+  } else if (walletError) console.log("Trading wallet error: " + walletError);
+  if (PAPER || wallet) {
+    riskDial().catch(() => {});
     setInterval(() => exitLoop().catch(() => {}), 20_000);
-    // Keep the free Render plan awake while Octo holds money, so exits keep running.
+    // Keep the free Render plan awake so exits keep running (and paper positions aren't lost to a sleep).
     const self = process.env.RENDER_EXTERNAL_URL;
     if (self) setInterval(() => fetch(self + "/health").catch(() => {}), 10 * 60_000);
-  } else if (walletError) console.log("Trading wallet error: " + walletError);
+  }
 });
