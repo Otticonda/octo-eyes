@@ -48,6 +48,10 @@ Going live needs all three: `PAPER_MODE=false`, a wallet in `OCTO_WALLET_KEY`, a
 4. **Exits**, checked every 20 seconds: stop loss, half at the first take profit, the rest at the second, **volume dried up**
    (last hour's volume under 20% of the coin's normal hourly pace, checked every 5 minutes), and max hold time.
 5. **Every refused buy is logged** with the rule that refused it, in `trade_journal`.
+6. **Honeypot checks.** No buy if the coin has mint or freeze authority on, or a Token-2022 trap: a transfer hook,
+   a permanent delegate, a transfer fee, accounts frozen by default, a pausable or non-transferable mint, or a
+   mint close authority. Then a **sell test**: Jupiter must quote selling the exact amount Octo would get back to SOL
+   for at least 70% of its worth. No route, or a worse quote, means no buy.
 
 ### Auto paper (the baseline)
 

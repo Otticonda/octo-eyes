@@ -17,7 +17,7 @@ const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const SECRET = (process.env.OCTO_SECRET || "").trim();
 const MCP_PATH = SECRET ? `/mcp/${SECRET}` : "/mcp";
 const STREAM_URL = "wss://pumpportal.fun/api/data";
-const VERSION = "3.8.1";
+const VERSION = "3.9.0";
 const PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
 const CA_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -573,7 +573,23 @@ async function safetyCheck(ca, hints = {}) {
       }
     }
 
+    // Token-2022 extensions that can stop holders from selling (or tax them on the way out).
+    const traps = [];
+    for (const x of info.extensions || []) {
+      const st = x.state || {};
+      if (x.extension === "transferHook" && st.programId) traps.push("transfer hook: another program runs on every transfer and can block sells");
+      if (x.extension === "permanentDelegate" && st.delegate) traps.push("permanent delegate: someone can move or burn anyone's tokens");
+      if (x.extension === "transferFeeConfig") {
+        const bps = Math.max(Number(st.newerTransferFee?.transferFeeBasisPoints) || 0, Number(st.olderTransferFee?.transferFeeBasisPoints) || 0);
+        if (bps > 0) traps.push(`transfer fee: ${bps / 100}% taken on every transfer`);
+      }
+      if (x.extension === "defaultAccountState" && String(st.accountState).toLowerCase() === "frozen") traps.push("accounts start frozen: new holders can't move their tokens");
+      if (x.extension === "nonTransferable") traps.push("non-transferable: tokens can't be sold");
+      if (/^pausable/i.test(x.extension || "")) traps.push("pausable: transfers can be switched off");
+      if (x.extension === "mintCloseAuthority" && st.closeAuthority) traps.push("mint close authority: the token can be closed");
+    }
     const flags = [];
+    for (const t of traps) flags.push("Honeypot risk, " + t + ".");
     if (info.mintAuthority) flags.push("Mint authority is ON: more tokens can be printed.");
     if (info.freezeAuthority) flags.push("Freeze authority is ON: holders' tokens can be frozen (honeypot risk).");
     if (top10 != null && top10 > 30) flags.push(`Top 10 holders own ${top10}% (excluding the bonding curve): concentrated.`);
@@ -588,6 +604,7 @@ async function safetyCheck(ca, hints = {}) {
       supply: total,
       mintAuthority: info.mintAuthority || null,
       freezeAuthority: info.freezeAuthority || null,
+      traps,
       top10HoldersPct: top10,
       devHoldingPct: devPct,
       topHolders: holders.slice(0, 12),
@@ -708,6 +725,7 @@ async function rugRadar(ca, pump, safety) {
 
     if (safety?.mintAuthority) add(40, "mint authority on");
     if (safety?.freezeAuthority) add(40, "freeze authority on");
+    if (safety?.traps?.length) add(100, "honeypot risk: " + safety.traps.join("; "));
     if (early?.checked) {
       if (early.bundledPct > 25) add(30, `${early.bundledWallets} wallets bundled ${early.bundledPct}% in the launch block`);
       else if (early.bundledPct > 10) add(20, `${early.bundledWallets} wallets bundled ${early.bundledPct}% in the launch block`);
@@ -1349,6 +1367,30 @@ async function poolSol(mint) {
 }
 
 // Every refused buy lands in the rejection log, so the rules themselves can be checked later.
+// Quote selling `tokensUi` back to SOL on Jupiter. ok only if a route exists and returns at least 70% of `worthSol`.
+async function sellTest(mint, tokensUi, decimals, worthSol) {
+  if (!(tokensUi > 0) || !(worthSol > 0)) return { ok: false, why: "nothing to test" };
+  const raw = BigInt(Math.max(1, Math.floor(tokensUi * 10 ** decimals))).toString();
+  const key = (process.env.JUP_API_KEY || "").trim();
+  const url = (host) => `https://${host}/swap/v1/quote?inputMint=${mint}&outputMint=${WSOL}&amount=${raw}&slippageBps=1500&restrictIntermediateTokens=true`;
+  let j = null;
+  let err = null;
+  for (const [host, opts] of [["lite-api.jup.ag", {}], ["api.jup.ag", key ? { headers: { "x-api-key": key } } : null]]) {
+    if (!opts) continue;
+    try {
+      j = await getJSON(url(host), opts, 8000, 0);
+      break;
+    } catch (e) {
+      err = e.message;
+    }
+  }
+  if (!j) return { ok: false, why: /400/.test(err || "") ? "no route to sell it back to SOL" : "sell quote unavailable (" + err + ")" };
+  const out = Number(j.outAmount) / 1e9;
+  if (!(out > 0)) return { ok: false, why: "no route to sell it back to SOL" };
+  const keep = out / worthSol;
+  return { ok: keep >= 0.7, keep: round(keep, 3), outSol: round(out, 6), why: keep < 0.7 ? `selling back would return only ${Math.round(keep * 100)}% of its worth` : null };
+}
+
 async function buy(mint, sol, reason, score, source = "chat") {
   try {
     return await buyInner(mint, sol, reason, score, source);
@@ -1391,13 +1433,19 @@ async function buyInner(mint, sol, reason, score, source) {
     if (safety?.found === false) throw new Error("That address isn't a token.");
     if (safety?.mintAuthority) throw new Error("Refused: mint authority is still on (more tokens can be printed).");
     if (safety?.freezeAuthority) throw new Error("Refused: freeze authority is on (honeypot risk).");
+    if (safety?.traps?.length) throw new Error("Refused, honeypot risk: " + safety.traps.join("; ") + ".");
+    if (!safety) throw new Error("Refused: couldn't run the safety check on this coin.");
 
     let sig;
     let tokens;
     let costSol = amt;
+    // Sell test: would the market actually buy these tokens back? No route, or a big loss on the way out, means no buy.
+    const quotePrice = await priceInSol(mint);
+    if (!(quotePrice > 0)) throw new Error("Couldn't price this coin.");
+    const sellBack = await sellTest(mint, (amt * (1 - PAPER_COST)) / quotePrice, safety.decimals ?? 6, (amt * (1 - PAPER_COST)));
+    if (!sellBack.ok) throw new Error("Refused, failed the sell test: " + sellBack.why + ".");
     if (PAPER) {
-      const price = await priceInSol(mint);
-      if (!(price > 0)) throw new Error("Couldn't price this coin for a paper fill.");
+      const price = quotePrice;
       tokens = (amt * (1 - PAPER_COST)) / price;
       costSol = round(amt + LIMITS.priorityFeeSol, 6);
       paper.cashSol = round(paper.cashSol - costSol, 6);
