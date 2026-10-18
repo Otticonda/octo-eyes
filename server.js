@@ -17,7 +17,7 @@ const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const SECRET = (process.env.OCTO_SECRET || "").trim();
 const MCP_PATH = SECRET ? `/mcp/${SECRET}` : "/mcp";
 const STREAM_URL = "wss://pumpportal.fun/api/data";
-const VERSION = "3.3.0";
+const VERSION = "3.4.0";
 const PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
 const CA_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -342,10 +342,23 @@ function ownCandles(ca, tf, n, solUsd) {
 
 // Price candles for a coin, oldest first: GeckoTerminal's chart of its main pool,
 // or Octo's own curve readings when that has less (brand-new pump.fun coins).
-const TIMEFRAMES = { "1m": ["minute", 1], "5m": ["minute", 5], "15m": ["minute", 15], "1h": ["hour", 1], "4h": ["hour", 4], "1d": ["day", 1] };
+const TIMEFRAMES = { "1s": ["second", 1], "1m": ["minute", 1], "5m": ["minute", 5], "15m": ["minute", 15], "1h": ["hour", 1], "4h": ["hour", 4], "1d": ["day", 1] };
 async function candles(ca, timeframe = "5m", limit = 120) {
   const tf = TIMEFRAMES[timeframe] ? timeframe : "5m";
   const n = Math.max(10, Math.min(300, Number(limit) || 120));
+  if (tf === "1s") {
+    const wasFollowing = tradeSubs.has(ca);
+    followTrades(ca);
+    const list = secondCandles(ca, n);
+    return {
+      found: list.length > 0,
+      source: list.length ? "live trades (PumpPortal)" : null,
+      timeframe: "1s",
+      following: true,
+      candles: list,
+      note: list.length ? undefined : wasFollowing ? "No trades on this coin in the last 15 minutes." : "Started following this coin's trades; 1s candles appear as trades come in.",
+    };
+  }
   return cached(`ohlcv:${ca}:${tf}:${n}`, 20_000, async () => {
     const solUsd = await solPriceUsd().catch(() => null);
     const own = ownCandles(ca, tf, n, solUsd);
@@ -741,6 +754,66 @@ async function tokenReport(ca) {
   };
 }
 
+// ---------------------------------------------------------------- live trades (1-second candles)
+// Octo follows every trade on a few coins at a time (what it holds and the scanner's top picks),
+// straight from PumpPortal's stream, and builds 1-second candles from them.
+const MAX_TRADE_SUBS = 12;
+const tradeSubs = new Map(); // mint -> last time something asked for it
+const tradeBuf = new Map(); // mint -> [{t, p (USD), v (USD)}]
+let solUsdNow = null;
+setInterval(() => solPriceUsd().then((v) => v && (solUsdNow = v)).catch(() => {}), 60_000);
+solPriceUsd().then((v) => v && (solUsdNow = v)).catch(() => {});
+
+function followTrades(mint, keep = false) {
+  if (!mint) return;
+  const was = tradeSubs.has(mint);
+  tradeSubs.set(mint, keep ? Infinity : Date.now());
+  if (was) return;
+  if (tradeSubs.size > MAX_TRADE_SUBS) {
+    const oldest = [...tradeSubs.entries()].filter(([, at]) => at !== Infinity).sort((a, b) => a[1] - b[1])[0];
+    if (oldest) {
+      tradeSubs.delete(oldest[0]);
+      tradeBuf.delete(oldest[0]);
+      if (ws && ws.readyState === 1) ws.send(JSON.stringify({ method: "unsubscribeTokenTrade", keys: [oldest[0]] }));
+    }
+  }
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
+}
+function recordTrade(m) {
+  const vSol = Number(m.vSolInBondingCurve), vTok = Number(m.vTokensInBondingCurve);
+  const priceSol = vSol > 0 && vTok > 0 ? vSol / vTok : Number(m.marketCapSol) > 0 ? Number(m.marketCapSol) / 1e9 : null;
+  if (!(priceSol > 0) || !solUsdNow) return;
+  let b = tradeBuf.get(m.mint);
+  if (!b) tradeBuf.set(m.mint, (b = []));
+  b.push({ t: Date.now(), p: priceSol * solUsdNow, v: (Number(m.solAmount) || 0) * solUsdNow });
+  const cut = Date.now() - 15 * 60_000;
+  while (b.length && (b[0].t < cut || b.length > 6000)) b.shift();
+}
+// 1-second candles; seconds with no trade carry the last close so time stays even.
+function secondCandles(mint, n) {
+  const b = tradeBuf.get(mint);
+  if (!b || !b.length) return [];
+  const end = Math.floor(Date.now() / 1000) * 1000;
+  const start = Math.max(Math.floor(b[0].t / 1000) * 1000, end - (n - 1) * 1000);
+  const by = new Map();
+  let before = null;
+  for (const x of b) {
+    const k = Math.floor(x.t / 1000) * 1000;
+    if (k < start) { before = x.p; continue; }
+    const c = by.get(k);
+    if (!c) by.set(k, { t: k, o: x.p, h: x.p, l: x.p, c: x.p, v: x.v });
+    else { c.h = Math.max(c.h, x.p); c.l = Math.min(c.l, x.p); c.c = x.p; c.v += x.v; }
+  }
+  const out = [];
+  let last = before;
+  for (let k = start; k <= end; k += 1000) {
+    const c = by.get(k);
+    if (c) { if (last != null) { c.o = last; c.h = Math.max(c.h, last); c.l = Math.min(c.l, last); } out.push(c); last = c.c; }
+    else if (last != null) out.push({ t: k, o: last, h: last, l: last, c: last, v: 0 });
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------- live stream (PumpPortal)
 const launches = [];
 const walletTrades = [];
@@ -766,6 +839,7 @@ function connectStream() {
     streamSince = new Date().toISOString();
     ws.send(JSON.stringify({ method: "subscribeNewToken" }));
     if (watched.size) ws.send(JSON.stringify({ method: "subscribeAccountTrade", keys: [...watched] }));
+    if (tradeSubs.size) ws.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [...tradeSubs.keys()] }));
   });
   ws.addEventListener("message", (ev) => {
     let m;
@@ -786,7 +860,9 @@ function connectStream() {
         at: new Date().toISOString(),
       });
       if (launches.length > 300) launches.pop();
-    } else if ((m.txType === "buy" || m.txType === "sell") && watched.has(m.traderPublicKey)) {
+    } else if (m.txType === "buy" || m.txType === "sell") {
+      if (m.mint && tradeSubs.has(m.mint)) recordTrade(m);
+      if (!watched.has(m.traderPublicKey)) return;
       walletTrades.unshift({
         wallet: m.traderPublicKey,
         side: m.txType,
@@ -1169,6 +1245,7 @@ async function sell(mint, percent, why) {
       pos.soldSol = round((pos.soldSol || 0) + (received || 0), 6);
       if (pct >= 100) {
         positions.delete(mint);
+        if (tradeSubs.get(mint) === Infinity) tradeSubs.set(mint, Date.now());
         const pnlSol = round(pos.soldSol - pos.costSol, 6);
         realizedToday += pnlSol;
         closedTrades.unshift({
@@ -1506,6 +1583,8 @@ async function scanTick() {
   });
   for (const [m, e] of scan) if (now - Date.parse(e.launchedAt) > 60 * 60_000) scan.delete(m);
   prunePriceHistory();
+  for (const m of positions.keys()) followTrades(m, true);
+  scannerPicks(3).then((r) => r.picks.forEach((p) => followTrades(p.mint))).catch(() => {});
 }
 
 async function scannerPicks(limit = 5) {
@@ -1689,7 +1768,7 @@ const TOOLS = [
   },
   {
     name: "candles",
-    description: "Price candles (open, high, low, close, volume in USD) for a Solana token's main pool, oldest first. Timeframes: 1m, 5m, 15m, 1h, 4h, 1d. Works for pump.fun coins once GeckoTerminal indexes them.",
+    description: "Price candles (open, high, low, close, volume in USD) for a Solana token, oldest first. Timeframes: 1s (built live from every pump.fun trade, last 15 minutes), 1m, 5m, 15m, 1h, 4h, 1d (GeckoTerminal, or Octo's own curve readings for brand-new coins).",
     inputSchema: {
       type: "object",
       properties: {
