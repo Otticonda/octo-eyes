@@ -101,6 +101,20 @@ Live trades go through PumpPortal's trade API, which charges a small fee per tra
 Positions and the journal live in memory. **A restart or redeploy clears the paper bank and journal.** The server pings itself
 every 10 minutes so the free plan doesn't sleep, but a redeploy still resets it. Live positions are rebuilt from the wallet after a restart.
 
+## Memory that survives restarts
+
+Render's free plan has no permanent disk, so every redeploy used to wipe Octo's paper bank and journal.
+Add a GitHub token and Octo saves its memory (paper bank, open paper positions, every closed trade,
+every refused buy and every fill) to a **private gist** on your GitHub account every 20 seconds and right
+before each restart, then loads it back on start.
+
+1. github.com → Settings → Developer settings → Personal access tokens → **Tokens (classic)** → Generate new token.
+   Tick only **gist**. No expiry, or a long one.
+2. On Render, add `GITHUB_TOKEN` with that token and save.
+
+The gist is named "octo-eyes memory (paper bank and trade journal)". Open it on GitHub anytime to read Octo's history;
+GitHub keeps every earlier version too. `STATE_GIST_ID` is optional and only needed to point at a specific gist.
+
 ## Deploy on Render (free)
 
 1. Put these files in a GitHub repo.

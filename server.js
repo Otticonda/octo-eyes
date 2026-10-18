@@ -17,7 +17,7 @@ const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const SECRET = (process.env.OCTO_SECRET || "").trim();
 const MCP_PATH = SECRET ? `/mcp/${SECRET}` : "/mcp";
 const STREAM_URL = "wss://pumpportal.fun/api/data";
-const VERSION = "3.7.0";
+const VERSION = "3.8.0";
 const PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
 const CA_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -830,7 +830,7 @@ async function startFollow(mint) {
   } catch {}
   if (!tradeSubs.has(mint)) return;
   if (onCurve) followCurve(mint);
-  else await followPool(mint);
+  else followPoolWithRetry(mint, 8);
 }
 
 function followCurve(mint) {
@@ -853,7 +853,7 @@ function followCurve(mint) {
       // Migrated: the curve is closed, trading moves to a PumpSwap pool. Follow that instead.
       wsUnsubscribe(`${mint}:curve`);
       note(`${mint.slice(0, 6)} migrated, following its pool`);
-      setTimeout(() => followPoolWithRetry(mint, 6), 4000);
+      setTimeout(() => followPoolWithRetry(mint, 8), 4000);
       return;
     }
     if (!(vTok > 0)) return;
@@ -865,21 +865,38 @@ function followCurve(mint) {
 }
 
 async function followPoolWithRetry(mint, tries) {
-  if (!tradeSubs.has(mint)) return;
+  if (!tradeSubs.has(mint) || following.get(mint)?.kind === "pool") return;
   try {
     if (await followPool(mint)) return;
+    if (tries <= 1) note(`no PumpSwap pool found for ${mint.slice(0, 6)}`);
   } catch (e) {
     note(`pool for ${mint.slice(0, 6)}: ${e.message}`);
   }
   if (tries > 1) setTimeout(() => followPoolWithRetry(mint, tries - 1), 15_000);
 }
 
+// A migrated pump.fun coin's canonical PumpSwap pool: derived from the mint, no lookup needed.
+const PUMP_AMM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
+function canonicalPool(mint) {
+  const authority = findPDA([Buffer.from("pool-authority"), pubkeyBytes(mint)], PUMP_PROGRAM);
+  const index = Buffer.alloc(2); // index 0, little-endian
+  return findPDA([Buffer.from("pool"), index, pubkeyBytes(authority), pubkeyBytes(mint), pubkeyBytes(WSOL)], PUMP_AMM);
+}
+async function findPool(mint) {
+  try {
+    const pool = canonicalPool(mint);
+    const acc = await rpc("getAccountInfo", [pool, { encoding: "base64", dataSlice: { offset: 0, length: 0 } }]);
+    if (acc?.value?.owner === PUMP_AMM) return pool;
+  } catch {}
+  const d = await getJSON(`https://api.dexscreener.com/latest/dex/tokens/${mint}`, {}, 8000, 0).catch(() => null);
+  const pairs = (d?.pairs || []).filter((p) => p.chainId === "solana" && p.quoteToken?.address === WSOL && p.baseToken?.address === mint);
+  pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
+  return (pairs.find((p) => /pump/i.test(p.dexId || "")) || pairs[0])?.pairAddress || null;
+}
+
 // Find the coin's PumpSwap pool, then watch its two vaults (the token and the SOL it holds).
 async function followPool(mint) {
-  const d = await getJSON(`https://api.dexscreener.com/latest/dex/tokens/${mint}`, {}, 8000, 0);
-  const pairs = (d.pairs || []).filter((p) => p.chainId === "solana" && p.quoteToken?.address === WSOL && p.baseToken?.address === mint);
-  pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
-  const pool = (pairs.find((p) => /pump/i.test(p.dexId || "")) || pairs[0])?.pairAddress;
+  const pool = await findPool(mint);
   if (!pool) return false;
   const [bv, qv] = await Promise.all([
     rpc("getTokenAccountsByOwner", [pool, { mint }, { encoding: "jsonParsed" }]),
@@ -1270,6 +1287,7 @@ async function swap(action, mint, amount) {
 function logTrade(t) {
   tradeLog.unshift({ ...t, at: new Date().toISOString() });
   if (tradeLog.length > 100) tradeLog.pop();
+  markDirty();
 }
 function rollDay() {
   const d = new Date().toISOString().slice(0, 10);
@@ -1282,6 +1300,7 @@ function rollDay() {
 function logReject(mint, reason, extra = {}) {
   rejections.unshift({ at: new Date().toISOString(), mint, reason, ...extra });
   if (rejections.length > 200) rejections.pop();
+  markDirty();
 }
 const withLock = (fn) => {
   const p = tradeLock.then(fn, fn);
@@ -1808,6 +1827,120 @@ async function recoverPositions() {
   }
 }
 
+// ---------------------------------------------------------------- memory that survives restarts
+// Octo's paper bank, open paper positions, closed trades, refused buys and fills are saved to a
+// private (secret) GitHub gist on the owner's account, and loaded back when the server starts.
+// Needs GITHUB_TOKEN with the "gist" permission. Without it, everything lives in memory only.
+const GH_TOKEN = (process.env.GITHUB_TOKEN || "").trim();
+const GIST_DESC = "octo-eyes memory (paper bank and trade journal)";
+const STATE_FILE = "octo-memory.json";
+let gistId = (process.env.STATE_GIST_ID || "").trim() || null;
+let stateDirty = false;
+let stateSaving = false;
+const memory = { on: !!GH_TOKEN, gist: null, loadedAt: null, loadedTrades: 0, savedAt: null, error: null };
+
+async function gh(path, opts = {}) {
+  const res = await fetch("https://api.github.com" + path, {
+    ...opts,
+    headers: { authorization: `Bearer ${GH_TOKEN}`, accept: "application/vnd.github+json", "user-agent": "octo-eyes", "content-type": "application/json", "x-github-api-version": "2022-11-28" },
+  });
+  if (!res.ok) throw new Error(`GitHub answered ${res.status}${res.status === 401 ? " (check GITHUB_TOKEN)" : res.status === 404 ? " (token needs the gist permission)" : ""}`);
+  return res.json();
+}
+function markDirty() {
+  stateDirty = true;
+}
+function stateSnapshot() {
+  return {
+    version: 1,
+    savedAt: new Date().toISOString(),
+    mode: PAPER ? "paper" : "live",
+    paper: { cashSol: paper.cashSol, startedAt: paper.startedAt },
+    day: { date: spentDay, spentSol: spentToday, realizedSol: realizedToday },
+    openPositions: PAPER ? [...positions.values()] : [],
+    closedTrades,
+    rejections,
+    fills: tradeLog,
+  };
+}
+const refill = (arr, items) => {
+  arr.length = 0;
+  for (const x of Array.isArray(items) ? items : []) arr.push(x);
+};
+async function loadMemory() {
+  if (!GH_TOKEN) return;
+  try {
+    if (!gistId) {
+      for (let page = 1; page <= 3 && !gistId; page++) {
+        const list = await gh(`/gists?per_page=100&page=${page}`);
+        gistId = list.find((g) => g.description === GIST_DESC)?.id || null;
+        if (list.length < 100) break;
+      }
+    }
+    if (!gistId) {
+      memory.loadedAt = new Date().toISOString();
+      return; // first run: the gist is created on the first save
+    }
+    const g = await gh(`/gists/${gistId}`);
+    const f = g.files?.[STATE_FILE];
+    let text = f?.content;
+    if (f?.truncated && f.raw_url) text = await (await fetch(f.raw_url, { headers: { authorization: `Bearer ${GH_TOKEN}` } })).text();
+    const s = JSON.parse(text || "{}");
+    memory.gist = g.html_url || null;
+    if (s.mode && s.mode !== (PAPER ? "paper" : "live")) {
+      memory.error = `Saved memory is from ${s.mode} mode; starting fresh in ${PAPER ? "paper" : "live"} mode (the old file is kept in the gist's history).`;
+      return;
+    }
+    if (PAPER && s.paper) {
+      if (Number.isFinite(s.paper.cashSol)) paper.cashSol = s.paper.cashSol;
+      if (s.paper.startedAt) paper.startedAt = s.paper.startedAt;
+      for (const p of s.openPositions || []) if (p?.mint) positions.set(p.mint, p);
+    }
+    if (s.day?.date === new Date().toISOString().slice(0, 10)) {
+      spentDay = s.day.date;
+      spentToday = Number(s.day.spentSol) || 0;
+      realizedToday = Number(s.day.realizedSol) || 0;
+    }
+    refill(closedTrades, s.closedTrades);
+    refill(rejections, s.rejections);
+    refill(tradeLog, s.fills);
+    memory.loadedAt = new Date().toISOString();
+    memory.loadedTrades = closedTrades.length;
+  } catch (e) {
+    memory.error = "load: " + e.message;
+  }
+}
+async function saveMemory(force = false) {
+  if (!GH_TOKEN || stateSaving || (!stateDirty && !force)) return;
+  stateSaving = true;
+  stateDirty = false;
+  try {
+    const body = { description: GIST_DESC, files: { [STATE_FILE]: { content: JSON.stringify(stateSnapshot(), null, 1) } } };
+    if (gistId) await gh(`/gists/${gistId}`, { method: "PATCH", body: JSON.stringify(body) });
+    else {
+      const g = await gh("/gists", { method: "POST", body: JSON.stringify({ ...body, public: false }) });
+      gistId = g.id;
+      memory.gist = g.html_url || null;
+    }
+    memory.savedAt = new Date().toISOString();
+    memory.error = null;
+  } catch (e) {
+    stateDirty = true;
+    memory.error = "save: " + e.message;
+  } finally {
+    stateSaving = false;
+  }
+}
+// Render stops the old server with SIGTERM on every redeploy: save first, then exit.
+for (const sig of ["SIGTERM", "SIGINT"]) {
+  process.on(sig, () => {
+    const done = () => process.exit(0);
+    if (!GH_TOKEN) return done();
+    stateDirty = true;
+    Promise.race([saveMemory(true), new Promise((r) => setTimeout(r, 8000))]).then(done, done);
+  });
+}
+
 // ---------------------------------------------------------------- coin scanner
 // Every 20s, reads the bonding curve of each coin launched in the last 40 minutes and tracks its momentum.
 const scan = new Map();
@@ -2022,6 +2155,7 @@ const TOOLS = [
         closedTrades: closedTrades.slice(0, n),
         openPositions: [...positions.values()],
         rejections: rejections.slice(0, Math.min(n, 50)),
+        memory: memory.on ? { savedTo: "private GitHub gist", gist: memory.gist, lastSaved: memory.savedAt, loadedAt: memory.loadedAt, error: memory.error } : { savedTo: null, note: "Add GITHUB_TOKEN (gist permission) on Render so trades survive restarts." },
       };
     },
   },
@@ -2129,7 +2263,7 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://localhost");
 
   if (url.pathname === "/" || url.pathname === "/health") {
-    return send(res, 200, { name: "Octo Eyes", version: VERSION, ok: true, rpc: RPC_KIND, stream: streamState, liveFeed: curveWsState, liveUpdates: curveTicks, liveSubscriptions: subToKey.size, feedNotes: streamNotes.slice(0, 3), launchesSeen: launches.length, watching: watched.size, mode: PAPER ? "paper" : "live", wallet: PAPER ? "paper" : wallet ? wallet.publicKey : walletError ? "error: " + walletError : "not set", trading: PAPER || wallet ? (tradingOn ? "on" : "paused") : "off", autoPaper: AUTO_PAPER ? "on" : "off", memeDial: dialCache?.memeDial ?? null, openPositions: positions.size, scannerTracking: scan.size, journalTrades: closedTrades.length });
+    return send(res, 200, { name: "Octo Eyes", version: VERSION, ok: true, rpc: RPC_KIND, stream: streamState, liveFeed: curveWsState, liveUpdates: curveTicks, liveSubscriptions: subToKey.size, feedNotes: streamNotes.slice(0, 3), launchesSeen: launches.length, watching: watched.size, mode: PAPER ? "paper" : "live", wallet: PAPER ? "paper" : wallet ? wallet.publicKey : walletError ? "error: " + walletError : "not set", trading: PAPER || wallet ? (tradingOn ? "on" : "paused") : "off", autoPaper: AUTO_PAPER ? "on" : "off", memeDial: dialCache?.memeDial ?? null, openPositions: positions.size, scannerTracking: scan.size, journalTrades: closedTrades.length, memory: { on: memory.on, savedAt: memory.savedAt, error: memory.error } });
   }
   if (url.pathname !== MCP_PATH) return send(res, 404, { error: "Not found" });
   if (req.method === "GET" || req.method === "DELETE") return send(res, 405, { error: "Method not allowed" }, { allow: "POST" });
@@ -2150,8 +2284,13 @@ const server = http.createServer(async (req, res) => {
   return out ? send(res, 200, out) : send(res, 202);
 });
 
-server.listen(PORT, () => {
+server.listen(PORT, async () => {
   console.log(`Octo Eyes listening on :${PORT}, MCP endpoint ${SECRET ? "/mcp/<secret>" : "/mcp"}`);
+  if (GH_TOKEN) {
+    await loadMemory();
+    console.log(memory.error ? "Memory: " + memory.error : `Memory loaded: ${memory.loadedTrades} closed trades, ${positions.size} open`);
+    setInterval(() => saveMemory().catch(() => {}), 20_000);
+  } else console.log("Memory: GITHUB_TOKEN not set, trades are kept in memory only");
   if (process.env.OCTO_NO_STREAM !== "1") {
     connectStream();
     connectCurveWs();
